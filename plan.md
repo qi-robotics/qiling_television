@@ -1,1012 +1,2043 @@
-# Quest 双臂灵巧手遥操作与 LeRobot 数据采集实施计划
-
-## 1. 文档目的
-
-本文档用于指导从零实现一套运行在机器人本体主机上的遥操作与数据采集系统。系统使用 Meta Quest 作为 XR 交互设备，参考 XRoboToolkit 的通信方式和 C++ 示例，通过 ROS 2 Humble 控制自研人形机器人的双臂与双侧 O6 灵巧手，并将三路相机、机器人状态和遥操作目标录制为 episode，最后离线转换为 LeRobot Dataset v3。
-
-本计划按可独立验证的阶段组织。每个阶段必须完成验收项后，才进入下一阶段，避免 XR、IK、机器人硬件和数据采集同时调试。
-
-## 2. 已确认的系统约束
-
-- 操作设备：Meta Quest，优先按 XRoboToolkit 已验证的 Quest 3 路线实现。
-- 机器人系统：Ubuntu 22.04、ROS 2 Humble。
-- 双臂：每条手臂 7 个关节，共 14DoF。
-- 灵巧手：左右各一只 O6，现有 ROS 2 控制话题和底层控制已经实现。
-- 机械臂 SDK：ROS 2 接口最高接收 50 Hz 控制目标。
-- 电机闭环：机器人内部已经存在高频闭环，上层不重做电机级控制。
-- 遥操作目标：直接控制左右手臂末端位姿。
-- IK：全 C++ 实现，使用 Pinocchio 做运动学，使用 ProxQP 做差分 IK/QP。
-- 相机：头部 D435，左右腕部各一台 D405。
-- 运行位置：XRoboToolkit PC Service、ROS 2、IK、机器人接口、图像服务和 episode 录制均运行在机器人本体主机；Quest 客户端运行在头显上。
-- 数据：运行时录制最小必要原始 episode，离线转换为 LeRobot Dataset v3。
-- 不采用 PyRoKi、PlaCo Python 或 TeleVuer 作为正式运行链路。
-- 不要求保留实际发送的 MIT 命令、`kp/kd/tau`、电流、力矩等非训练字段。
-- 当前目录中的 TeleVision、Isaac Gym 等内容不作为新实现的架构基础。
-
-## 3. 最终运行链路
-
-```text
-Meta Quest
-  ├── 头部 / 控制器 / 手部跟踪
-  └── 机器人头部视频显示
-          │
-          │ XRoboToolkit 网络协议
-          v
-XRoboToolkit PC Service（机器人主机，C++）
-          │ 最新 XR 帧：pose + tracking validity + source timestamp
-          v
-qiling_xr_bridge（ROS 2 C++）
-          │
-          v
-qiling_teleop_controller（固定 50 Hz，C++）
-  ├── clutch / 重定位 / 缩放
-  ├── XR 坐标系到 robot_base 的变换
-  ├── Pinocchio FK/Jacobian
-  ├── ProxQP 双臂差分 IK
-  ├── 关节、速度、工作空间和求解状态检查
-  └── 生成双臂关节目标与 O6 目标
-          │
-          ├──> 现有手臂 ROS 2 SDK 接口（最高 50 Hz）
-          └──> 现有 O6 ROS 2 控制话题
-
-D435 + 左 D405 + 右 D405
-          ├──> Quest 视频服务
-          └──> Episode Recorder
-
-机器人实际状态 + 三路 RGB + EE/O6 action + task
-          │
-          v
-原始 episode（按 topic 白名单记录）
-          │
-          v
-离线转换器（Conda Python 3.10）
-          │
-          v
-LeRobot Dataset v3
-```
-
-### 3.1 频率划分
-
-| 模块 | 目标频率 | 说明 |
-|---|---:|---|
-| Quest 跟踪输入 | 由设备决定，通常高于 50 Hz | 保存最新有效样本，不堆积历史命令 |
-| 双臂控制与 IK | 50 Hz | 使用单调时钟，周期 20 ms |
-| 手臂 SDK 目标发送 | 不超过 50 Hz | 与 SDK 上限严格一致 |
-| O6 目标发送 | 由现有接口上限决定 | 可与手臂控制 tick 同步 |
-| RGB 相机 | 初始 30 FPS | 最终按 USB 带宽和模型需求确定 |
-| Episode 逻辑帧率 | 初始 30 FPS | 离线按时间戳对齐，不要求所有源同频 |
-| 机器人内部电机闭环 | 已有高频闭环 | 不属于本项目实现范围 |
-
-## 4. 推荐的新项目结构
-
-```text
-qiling_television/
-├── README.md
-├── plan.md
-├── LICENSE
-├── assets/
-│   └── robot/
-│       ├── urdf/
-│       ├── meshes/
-│       └── srdf/                         # 可选：碰撞对和规划组
-├── configs/
-│   ├── robot.yaml                        # joint/link/frame 名称及顺序
-│   ├── xr.yaml                           # Quest 输入、缩放、clutch 配置
-│   ├── ik.yaml                           # QP 权重、速度、阻尼和误差阈值
-│   ├── safety.yaml                       # 限位、超时、工作空间和状态机
-│   ├── cameras.yaml                      # serial、分辨率、FPS、topic
-│   ├── o6.yaml                           # O6 映射、方向、零位和限幅
-│   └── recording.yaml                    # topic 白名单和 episode 参数
-├── calibration/
-│   ├── xr_to_robot.yaml
-│   ├── camera_extrinsics.yaml
-│   └── o6_mapping.yaml
-├── ros2_ws/
-│   └── src/
-│       ├── qiling_interfaces/            # 必要的自定义 msg/srv/action
-│       ├── qiling_description/           # URDF、robot_state_publisher
-│       ├── qiling_xr_bridge/             # XRoboToolkit C++ -> ROS 2
-│       ├── qiling_kinematics/             # Pinocchio + ProxQP C++ 库
-│       ├── qiling_teleop_controller/      # 50 Hz 控制、安全状态机
-│       ├── qiling_robot_adapter/          # 现有手臂 SDK 接口适配
-│       ├── qiling_o6_adapter/             # 现有 O6 topic 适配与映射
-│       ├── qiling_camera/                 # RealSense 启动与视频桥接
-│       ├── qiling_episode_recorder/       # episode 开始/结束和 rosbag2 白名单
-│       └── qiling_bringup/                # launch、参数与生命周期编排
-├── tools/
-│   ├── lerobot_converter/                # 原始 episode -> LeRobot v3
-│   ├── calibration/                      # XR、相机、O6 标定工具
-│   ├── replay/                           # XR/状态/action 回放工具
-│   └── benchmark/                        # IK、延迟、频率、丢帧测试
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   ├── recorded_inputs/
-│   └── expected_outputs/
-├── third_party/
-│   └── README.md                         # 只记录外部依赖版本和获取方式
-└── docs/
-    ├── interfaces.md
-    ├── coordinate_frames.md
-    ├── safety.md
-    ├── calibration.md
-    ├── recording.md
-    └── operations.md
-```
-
-原则：不直接修改 XRoboToolkit、Pinocchio、ProxQP 或机器人 SDK 的源代码。通过 adapter 封装第三方接口，并锁定可复现的 commit/tag。
-
-## 5. 进程与线程边界
-
-### 5.1 建议进程
-
-1. `xrobotoolkit_pc_service`：接收 Quest 数据。
-2. `qiling_xr_bridge`：将 C++ callback 数据转换为带时间戳的 ROS 2 消息。
-3. `qiling_teleop_controller`：唯一的 50 Hz 双臂目标生成器。
-4. `qiling_robot_adapter`：连接现有手臂 SDK 话题。
-5. `qiling_o6_adapter`：连接现有 O6 控制与反馈话题。
-6. 三个 RealSense 节点：按 serial 固定头部、左腕和右腕相机。
-7. Quest 视频桥接进程：只负责操作者画面，不参与训练数据采样。
-8. `qiling_episode_recorder`：独立进程，避免图像编码影响控制循环。
-9. `robot_state_publisher`：提供机器人 TF，仅保留一个发布源。
-
-### 5.2 控制器内部线程
-
-- XR 接收回调只更新“最新完整样本”，不在回调中求 IK。
-- ROS 2 状态回调只更新关节/O6 状态缓存。
-- 独立 50 Hz 控制线程读取一次一致快照，完成目标生成、IK、安全检查和发布。
-- 控制 tick 中避免动态内存分配、磁盘 I/O、日志刷屏和阻塞网络调用。
-- ProxQP problem structure、Eigen 缓冲区和 Pinocchio data 在启动阶段预分配。
-- 图像采集、视频编码和数据写盘不得运行在控制线程。
-
-## 6. ROS 2 接口设计原则
-
-具体 topic 名称以现有 SDK 为准，下面是项目内部的规范化接口。
-
-### 6.1 XR 输入
-
-建议定义一个完整的 `XRFrame`，一次携带同一源时刻的设备状态：
-
-```text
-header.stamp
-source_timestamp_ns
-head_pose
-left_controller_pose
-right_controller_pose
-left_hand_joints[]
-right_hand_joints[]
-head_valid
-left_valid
-right_valid
-buttons / triggers / clutch state
-```
-
-如果 XRoboToolkit 输出的是 JSON，只在 `qiling_xr_bridge` 中解析一次。控制器内部不使用 JSON。
-
-建议 topic：
-
-```text
-/qiling/xr/frame
-/qiling/xr/status
-```
-
-QoS：`KEEP_LAST(1)`，优先新鲜度，禁止旧 XR 数据排队进入控制器。
-
-### 6.2 机器人状态
-
-```text
-/joint_states                         # 双臂实际关节位置，名称必须稳定
-/o6/left/state                       # 现有接口或 adapter 后的统一接口
-/o6/right/state
-```
-
-双臂关节不能依赖 `JointState.position[]` 的偶然排列，必须按 `name` 映射到配置文件定义的固定 14 维顺序。
-
-### 6.3 遥操作 action
-
-训练数据所记录的 action 是“控制器在该 tick 接受并用于求解的任务空间目标”，不是 Quest 原始姿态，也不是 MIT 底层命令：
-
-```text
-/qiling/teleop/action
-  stamp
-  left_ee_target_in_robot_base       # xyz + quaternion
-  right_ee_target_in_robot_base      # xyz + quaternion
-  left_o6_target[]
-  right_o6_target[]
-  valid
-```
-
-### 6.4 控制输出
-
-```text
-/qiling/arm/joint_target             # adapter 内部接口，14 维 q_target
-/existing_arm_sdk_command_topic      # 现有 SDK topic
-/existing_o6_left_command_topic
-/existing_o6_right_command_topic
-```
-
-现有 SDK 如果要求 MIT 消息，则由 `qiling_robot_adapter` 填充所需字段。MIT 消息不进入训练 episode。
-
-### 6.5 控制服务
-
-```text
-/qiling/teleop/arm
-/qiling/teleop/disarm
-/qiling/teleop/enable
-/qiling/teleop/disable
-/qiling/teleop/reset_fault
-/qiling/episode/start
-/qiling/episode/stop
-/qiling/episode/discard
-```
-
-服务名称可调整，但必须区分“控制使能”和“数据录制”，不能因为开始录制而自动使能机器人。
-
-## 7. 坐标系与遥操作语义
-
-### 7.1 必须固定的坐标系
-
-- `robot_base`：双臂 IK 的统一参考坐标系。
-- `left_ee`、`right_ee`：URDF 中用于任务空间控制的末端 frame。
-- `xr_origin`：Quest 会话原点。
-- `xr_head`、`xr_left_controller`、`xr_right_controller`。
-- `camera_head_color_optical_frame`。
-- `camera_left_wrist_color_optical_frame`、`camera_right_wrist_color_optical_frame`。
-
-在 `docs/coordinate_frames.md` 明确每个坐标系的：
-
-- 右手系/左手系；
-- 轴方向；
-- 四元数顺序，统一为内部 Eigen/ROS 约定；
-- pose 表示的是 `T_parent_child` 还是其逆；
-- 长度单位，统一为米；
-- 时间戳来源。
-
-### 7.2 相对遥操作
-
-启动遥操作时，不将 Quest 的绝对空间位置直接映射到机器人。采用相对映射：
-
-```text
-T_robot_target(t)
-  = T_robot_ee_at_clutch
-  * ScaleAndRotate(
-      inverse(T_xr_hand_at_clutch) * T_xr_hand(t)
-    )
-```
-
-要求：
-
-- clutch 按下时冻结机器人目标并重新记录 XR/机器人锚点；
-- 支持平移缩放和旋转缩放独立配置；
-- 左右臂锚点独立保存，但使能状态统一管理；
-- Quest tracking origin 重置后必须重新 clutch，禁止产生跳变；
-- 四元数归一化，并在相邻帧保持符号连续。
-
-## 8. C++ 差分 IK 设计
-
-### 8.1 基本形式
-
-QP 决策变量初始为双臂 14 维关节速度 `qdot`，必要时加入末端任务松弛变量。
-
-每个控制 tick：
-
-1. 从实际 `q` 做 Pinocchio FK。
-2. 计算左右末端当前位姿与目标位姿之间的 SE(3) 误差。
-3. 对位置误差和旋转 log-map 误差施加增益与速度限幅，得到期望末端 twist。
-4. 计算左右末端 Jacobian。
-5. 构建并 warm-start ProxQP。
-6. 求解 `qdot`。
-7. 根据 20 ms 周期积分得到 `q_target`。
-8. 再次执行位置、速度、加速度和单周期步长限制。
-9. 只有状态有效且 QP 通过验收，才发布目标。
-
-基本目标函数：
-
-```text
-minimize
-    w_left  * ||J_left  qdot - v_left_des ||^2
-  + w_right * ||J_right qdot - v_right_des||^2
-  + w_posture * ||qdot - qdot_posture||^2
-  + w_smooth  * ||qdot - qdot_previous||^2
-  + w_damping * ||qdot||^2
-  + slack penalties
-```
-
-基本约束：
-
-- 关节位置预测约束：`q_min + margin <= q + dt*qdot <= q_max - margin`；
-- 关节速度上下限；
-- 单周期加速度/速度变化限制；
-- 可选工作空间线性约束；
-- 后续加入自碰撞距离线性化约束。
-
-### 8.2 拟人化动作
-
-每条 7DoF 手臂有冗余自由度。拟人化优先通过次级目标实现：
-
-- 肩部和肘部默认姿态 `q_nominal`；
-- 肘部 frame 的位置/平面偏好；
-- 远离关节限位的代价；
-- 远离奇异位形的阻尼或可操作度代价；
-- 左右肩部动作对称性只作为软约束，不强制对称；
-- 双手共同操作物体时，可增加左右末端相对位姿软任务。
-
-第一版不加入复杂碰撞约束。先保证单臂和双臂 QP 稳定，再加入躯干/双臂自碰撞线性化，以便定位性能和不可行问题。
-
-### 8.3 求解失败处理
-
-下面任一条件触发本 tick 无效：
-
-- ProxQP 非成功状态；
-- 求解时间超过配置阈值；
-- 末端残差超过阈值；
-- 输出包含 NaN/Inf；
-- `q_target` 越界；
-- 单 tick 关节变化超过上限；
-- 连续状态或 XR 数据过期。
-
-短暂单次失败可以保持上一安全目标；连续失败达到阈值后进入 `FAULT`，停止接受新的遥操作目标。不能在求解失败时继续积分上一次 `qdot`。
-
-### 8.4 性能目标
-
-- 控制周期：20 ms。
-- QP/IK 平均耗时：目标小于 2 ms。
-- QP/IK P99：目标小于 5 ms。
-- 完整控制 tick P99：目标小于 10 ms。
-- 30 分钟运行期间控制 deadline miss 比例：小于 0.1%。
-- 运行中不得出现周期性动态分配导致的明显尖峰。
-
-这些是项目验收目标，不是未经实测的性能承诺；最终数值必须在机器人本体主机上测量。
-
-## 9. 安全状态机
-
-### 9.1 状态
-
-```text
-DISCONNECTED
-    -> STANDBY
-    -> ARMED
-    -> TELEOP
-    -> STANDBY
-
-任意活动状态 -> FAULT
-硬件急停     -> ESTOP
-```
-
-- `DISCONNECTED`：缺少机器人状态、XR 或 SDK。
-- `STANDBY`：只读状态，不发送活动目标。
-- `ARMED`：依赖检查通过，但遥操作仍未开始。
-- `TELEOP`：50 Hz 发布目标。
-- `FAULT`：软件故障，需要明确复位。
-- `ESTOP`：硬件急停或底层急停，软件不得自动解除。
-
-### 9.2 使能条件
-
-进入 `TELEOP` 前同时满足：
-
-- 急停已释放，但不由本程序主动解除；
-- 双臂状态时间戳新鲜；
-- O6 状态有效；
-- Quest 左右跟踪有效；
-- URDF 关节顺序与反馈完全匹配；
-- 当前关节在软件限位内；
-- 当前 FK 与初始 target 一致，不会使能即跳动；
-- 用户完成 clutch/锚点初始化；
-- SDK adapter 已连接并报告可接受目标；
-- IK 已完成一次无输出的 dry-run。
-
-### 9.3 看门狗与限制
-
-所有阈值写入 `safety.yaml`，初始建议值必须通过低速测试校准：
-
-- XR 样本过期阈值；
-- 机器人状态过期阈值；
-- 最大末端线速度、角速度；
-- 每关节最大速度、加速度、单 tick 步长；
-- 关节软限位 margin；
-- 左右手允许工作空间；
-- 连续 IK 失败次数；
-- SDK 发布失败次数；
-- 网络断开后的保持时间和退出策略。
-
-Quest 手势不能替代物理急停。正式硬件测试必须有机器人旁的物理急停和一名观察人员。
-
-## 10. O6 灵巧手接入
-
-O6 底层控制已经存在，本项目只实现 XR 手部输入到现有控制 action 的映射。
-
-### 10.1 接口调查
-
-接入前必须记录：
-
-- 每只手的控制维度和反馈维度；
-- topic 名称、消息类型和 QoS；
-- 每个控制量的物理含义、方向、单位、零位和范围；
-- 是否存在耦合、欠驱动或内部协同控制；
-- 最大命令频率；
-- 超时后的底层行为；
-- 是否能读取实际位置/开合量。
-
-### 10.2 第一版映射
-
-1. 从 Quest/OpenXR 手骨架计算每根手指的归一化弯曲量。
-2. 根据 O6 的实际控制空间做线性或分段线性映射。
-3. 使用每只手独立的零位、方向和范围配置。
-4. 增加低通、死区、速率限制和饱和。
-5. tracking 无效时保持短时间，随后进入配置的安全手型。
-
-如果 O6 是耦合手，不直接尝试逐关节复制 OpenXR 26 个关节，而是先映射到 O6 可控的低维 action。
-
-### 10.3 验收
-
-- 手完全张开、自然弯曲、握拳、拇指对掌等关键姿态方向正确；
-- tracking 抖动不会导致 O6 高频振荡；
-- 左右手镜像关系正确；
-- 达到限位时无积分累积；
-- 录制的 O6 action 与真正提供给现有 O6 控制接口的高层目标一致。
-
-## 11. 相机与 Quest 视频
-
-### 11.1 RealSense 配置
-
-- 用 serial number 固定三台相机角色，禁止按 `/dev/video*` 顺序识别。
-- 第一版仅采集训练需要的 RGB，不录深度和无关红外流。
-- 初始建议 640×480 或模型目标分辨率、30 FPS。
-- 分别验证每台相机，再同时运行三台相机。
-- 检查三台设备是否分布在足够的 USB 控制器上。
-- 记录相机 ROS header timestamp 和接收时的单调/ROS 时间关系。
-- 相机外参标定结果版本化保存，不逐帧写入数据集。
-
-### 11.2 D435 显示限制
-
-D435 提供单路 RGB，不等于双目彩色视频。第一版 Quest 显示采用以下一种方式：
-
-- 将头部 RGB 显示在 Quest 虚拟面板中；或
-- 将同一 RGB 图像送入左右眼纹理，提供单目远程画面。
-
-如果后续要求真实立体彩色视频，需要增加适合的双目彩色相机；该需求不阻塞双臂控制和数据采集。
-
-### 11.3 视频链路与数据链路分离
-
-- Quest 视频可以压缩、降分辨率或丢帧，以低延迟优先。
-- Episode 必须从相机原始 ROS 图像 topic 采集，不记录 Quest 显示端二次编码画面。
-- 视频编码阻塞不得影响控制线程。
-
-## 12. Episode 最小数据规范
-
-### 12.1 训练字段
-
-最终 LeRobot v3 每帧只包含：
-
-| 字段 | 内容 | 维度/形式 |
+# Qiling Television：Quest 3 双臂灵巧手遥操与 IK 实施计划
+
+本文档是当前项目的实施基线。内容按照当前工作空间中的实际代码、模型、ROS 2 话题和已经确认的交互方式整理，既描述已经完成的部分，也描述接下来需要逐步实现和验证的部分。
+
+目标是使用 Meta Quest 3 作为操作者输入，通过 XRoboToolkit / PXREA SDK 获取左右手柄的 6DoF 位姿和按键状态，经坐标系转换、抓取式离合（clutch）和目标位姿生成后，使用全 C++ 的 Pinocchio + ProxQP 差分 IK 控制 MuJoCo 中的双臂；仿真链路稳定后，再接入真实双臂机器人和 O6 灵巧手，最后按 LeRobot 数据集所需字段录制 episode，并通过独立转换脚本生成最终数据集。
+
+---
+
+## 1. 总体目标和边界
+
+### 1.1 最终目标
+
+系统最终应完成以下闭环：
+
+~~~text
+Meta Quest 3 手柄
+        |
+        v
+XRoboToolkit PC Service / PXREA SDK
+        |
+        v
+ROS 2 XR 输入适配器
+        |
+        v
+手柄坐标系 -> 机器人 base_link 坐标系
+        |
+        v
+Grip 离合、零点重置、目标位姿生成
+        |
+        v
+双臂全 6D 位姿目标
+        |
+        v
+C++ Pinocchio FK/Jacobian + ProxQP 差分 IK
+        |
+        v
+双臂关节目标
+        |
+        +--------------------+
+        |                    |
+        v                    v
+MuJoCo 仿真              真实机器人 ROS 2 驱动
+        |                    |
+        +----------+---------+
+                   v
+             状态同步与录制
+                   |
+                   v
+          独立 LeRobot 转换脚本
+~~~
+
+### 1.2 当前明确的硬约束
+
+1. 机器人为双臂人形机器人。
+2. 每条手臂 7 个关节。
+3. O6 灵巧手必须参与控制；O6 的控制接口已经在另一个工作空间中实现，当前约定通过 ROS 2 话题复用。
+4. 机器人 SDK 对手臂控制接口最高接收频率为 50 Hz。
+5. 真实机器人目前只有 ROS 2 Humble 驱动。
+6. IK 必须采用全 C++ 实现。
+7. Pinocchio 用于运动学、雅可比和位姿误差计算。
+8. ProxQP 用于每个控制周期的差分 IK / QP 求解。
+9. 第一阶段采用固定 base_link、腿部只显示不控制的仿真模式。
+10. 腿部仍保留在 MuJoCo 场景和 40 维接口中，但 IK 不求解腿部，腿部命令被忽略。
+11. 当前遥操输入采用 Quest 3 左右手柄。
+12. 左右手柄的 Grip 按键分别作为左右手的 clutch，不使用独立 clutch 按键。
+13. 当前控制方式为统一 6D 位姿控制：按住对应 Grip 后，手柄的相对平移和相对旋转同时映射到对应手腕目标。
+14. 暂不采用“Grip 只控制平移、Grip + X/A 只控制姿态”的分离模式。
+15. 当前阶段先不考虑 Quest 内的视频回传，Quest 侧可暂时只用于输入控制。
+16. MuJoCo 当前只有头部 D435 相机；两个腕部 D405 只在机器人描述和后续真实系统规划中保留。
+17. episode 录制不直接写成最终 LeRobot 格式，而是先录制必要的原始/中间数据，再使用独立脚本转换。
+18. 录制只保留训练实际需要的字段，不录制不必要的底层控制细节，例如实际发送的 MIT 命令。
+
+### 1.3 当前阶段不纳入的内容
+
+以下内容不是第一阶段的实现目标：
+
+- 用 PyRoki 或 CasADi + IPOPT 替换当前 C++ QP IK。
+- 每帧运行非线性优化器。
+- 腿部遥操。
+- 头部和腰部的全身协调控制。
+- Quest 内立体渲染和左右拼接视频。
+- 将 MuJoCo 中的 D435、D405 完整模拟为真实 RGB-D 传感器。
+- 直接把 MIT kp、kd、position、velocity、effort 命令作为训练 observation/action。
+
+---
+
+## 2. 代码包和职责划分
+
+当前工作空间主要包含以下 ROS 2 包：
+
+~~~text
+src/
+├── common_msgs/
+│   └── mit_msgs/
+├── communicate_interface/
+├── qi_robot_description/
+├── mujoco_simulator/
+├── mujoco_d435_publisher/
+└── qiling_kinematics/
+~~~
+
+### 2.1 common_msgs/mit_msgs
+
+职责：
+
+- 提供 MITLowState 等低状态消息。
+- 提供 MITJointCommands 等关节命令消息。
+- 连接 MuJoCo、差分 IK 和真实机器人控制接口。
+
+当前重要约定：
+
+- 仿真控制命令话题为 /human_lower_command。
+- 仿真状态话题为 /human_lower_state。
+- /human_lower_command 当前要求消息长度与 MuJoCo 模型的执行器数量严格一致，即 40。
+- 40 维中同时包含腿部、双臂和 O6 等关节槽位。
+
+### 2.2 qi_robot_description
+
+职责：
+
+- 保存机器人 URDF、网格和 MuJoCo 模型。
+- 为 Pinocchio 提供计算用 URDF。
+- 为 MuJoCo 提供仿真场景。
+
+当前关键文件：
+
+~~~text
+src/qi_robot_description/
+├── urdf/
+│   ├── s4_dual_arm.urdf
+│   ├── s4_40DOF_fullbody.urdf
+│   └── s4_40DOF_fullbody_with_handeye_camera.urdf
+└── new_scene/
+    ├── scene_S4_40DOF_fullbody.xml
+    └── S4_40DOF_fullbody.xml
+~~~
+
+模型文件的职责必须严格区分：
+
+| 文件 | 用途 | 是否用于当前 IK |
 |---|---|---|
-| `observation.images.head` | D435 RGB | image/video frame |
-| `observation.images.left_wrist` | 左腕 D405 RGB | image/video frame |
-| `observation.images.right_wrist` | 右腕 D405 RGB | image/video frame |
-| `observation.state` | 双臂实际关节位置 + 左右 O6 实际状态 | `14 + N_state_left + N_state_right` |
-| `action` | 左右 EE 目标位姿 + 左右 O6 目标 | `14 + N_action_left + N_action_right` |
-| `task` | episode 任务文本 | string/index |
+| urdf/s4_dual_arm.urdf | 只包含双臂 14 个关节的 Pinocchio 计算模型 | 是 |
+| urdf/s4_40DOF_fullbody.urdf | ROS 2 robot_state_publisher 等完整机器人描述 | 否，当前不作为 IK 模型 |
+| urdf/s4_40DOF_fullbody_with_handeye_camera.urdf | 带头部和腕部相机标定关系的完整 URDF | 用于相机位姿参考 |
+| new_scene/scene_S4_40DOF_fullbody.xml | MuJoCo 启动入口场景 | 是 |
+| new_scene/S4_40DOF_fullbody.xml | MuJoCo 机器人主体、执行器、关键帧和相机定义 | 是 |
 
-左右 EE action 均使用 `robot_base` 下的绝对 `xyz + quaternion`。四元数必须归一化并做符号连续处理。
+### 2.3 mujoco_simulator
 
-### 12.2 明确不进入训练数据的内容
+职责：
 
-- 实际发送的 MIT 命令；
-- `kp`、`kd`、`tau`；
-- 电机电流、温度和诊断量；
-- IK 输出关节目标；
-- Quest 原始头部、控制器和手骨架 pose；
-- QP Hessian、Jacobian、残差和求解器内部状态；
-- 关节速度，除非后续模型明确把它作为 observation；
-- 实际 EE pose，因为可由实际关节位置和 URDF 重算；
-- 深度和红外图像，除非后续训练明确需要。
+- 加载 MuJoCo 场景。
+- 发布 MuJoCo 机器人状态。
+- 接收 /human_lower_command。
+- 进行固定 base、冻结腿部、home 过渡和外部关节命令执行。
+- 发布 /joint_states 供 Pinocchio 差分 IK 使用。
+- 发布 /mujoco/qpos 供相机发布节点使用。
 
-软件运行日志可以单独保留故障摘要，但不能混入 LeRobot feature schema。
+### 2.4 mujoco_d435_publisher
 
-### 12.3 原始 episode 必须保留的同步元数据
+职责：
 
-以下数据不作为模型输入，但离线转换不可缺少：
+- 在 MuJoCo 中读取 d435_camera。
+- 根据 /mujoco/qpos 更新机器人姿态。
+- 发布仿真相机彩色图像和 CameraInfo。
+- 为后续数据录制和可视化提供相机输入。
 
-- 每条消息的源时间戳和录制时间戳；
-- episode 开始、结束和 discard 状态；
-- task 文本；
-- 相机 serial 与 topic 的映射；
-- robot/config/calibration 版本标识；
-- 丢帧和时间戳回退统计。
+当前阶段它不是 Quest 视频传输节点。它可以帮助生成 ROS 2 图像话题，但不能自动把图像送入 Quest。Quest 视频显示属于后续 XR 视频链路，需要单独设计。
 
-### 12.4 原始录制 topic 白名单
+### 2.5 qiling_kinematics
 
-```text
-/camera/head/color/image_raw
-/camera/left_wrist/color/image_raw
-/camera/right_wrist/color/image_raw
-/joint_states
-/o6/left/state
-/o6/right/state
-/qiling/teleop/action
-/qiling/episode/event
-```
+职责：
 
-topic 名称最终按实际驱动修改。禁止使用“录制全部 ROS 2 topics”的方式。
+- C++ Pinocchio 运动学。
+- C++ ProxQP 差分 IK。
+- Quest/XR 输入到机器人位姿目标的桥接。
+- PXREA SDK 到 ROS 2 的适配。
 
-### 12.5 时间对齐规则
+当前关键源文件：
 
-- 机器人主机使用统一 ROS time，并同步系统时钟。
-- 原始录制保留各源原始时间戳，不在写盘时强行伪造同频帧。
-- 离线转换以目标数据集 FPS 建立时间轴。
-- `observation.state` 和 `action` 使用最近邻或零阶保持，规则必须固定。
-- 图像选择最近帧，并记录最大允许时间差；超出阈值的帧或 episode 判为无效。
-- action 取“控制器该 tick 真正接受的 EE/O6 高层目标”，不取 90 Hz Quest 原始目标。
-- 转换报告必须包含各源时间差分布和丢帧率。
-
-## 13. 环境管理
-
-### 13.1 实时运行环境
-
-- 使用系统 ROS 2 Humble：`/opt/ros/humble`。
-- C++ 工程使用 `colcon`、`ament_cmake` 和 C++17。
-- Pinocchio、ProxQP、Eigen 和 XRoboToolkit PC Service 锁定版本。
-- 优先通过 apt/rosdep 安装；没有合适系统包时建立独立 vendor package。
-- 正式 ROS 2 控制进程不从 Conda 环境启动，避免 Python、libstdc++ 和动态库冲突。
-
-### 13.2 离线转换环境
-
-- 可以在机器人主机安装 Conda。
-- 建立独立 Python 3.10 环境用于 LeRobot v3 转换、校验和上传。
-- 不在该环境中重新安装 ROS 2 Humble。
-- 转换器优先直接读取 rosbag2/原始 episode 文件，不要求在 Conda 中运行 `rclpy`。
-- 锁定 LeRobot、PyTorch、视频编码依赖和数据格式版本。
-
-### 13.3 Quest 客户端
-
-- 从 XRoboToolkit 官方 Quest Unity Client 的已验证 Unity/Meta XR/Oculus 插件版本起步。
-- Quest 应用可以在单独开发机上构建，运行时只要求头显连接机器人主机 PC Service。
-- 如果设备不是 Quest 3，先做兼容性验证，不默认视为官方已验证硬件。
-
-## 14. 分阶段实施步骤
-
-## 阶段 0：冻结硬件与接口事实
-
-### 任务
-
-- 确认 Quest 具体型号和系统版本。
-- 收集完整双臂 URDF、mesh、joint limit 和末端 frame。
-- 收集手臂 SDK ROS 2 topic、消息定义、QoS、50 Hz 限制和超时行为。
-- 收集 O6 topic、消息定义、控制/反馈维度、限位和频率。
-- 记录机器人主机 CPU、GPU、内存、网卡和 USB 控制器拓扑。
-- 记录三台 RealSense serial number。
-- 确认物理急停工作方式。
-- 建立 `docs/interfaces.md`，将未知字段列为阻塞项。
-
-### 交付物
-
-- `docs/interfaces.md`
-- `configs/robot.yaml` 初稿
-- `configs/o6.yaml` 初稿
-- `configs/cameras.yaml` 初稿
-- URDF 与 mesh 可被版本控制或通过明确脚本获取
-
-### 验收门槛
-
-- 能明确列出双臂固定 14 维关节顺序。
-- 能明确指出左右末端 frame。
-- 能用命令行查看手臂和 O6 的状态 topic。
-- 能解释 SDK 收到命令中断后机器人会做什么。
+~~~text
+src/qiling_kinematics/src/
+├── differential_ik_node.cpp
+├── xr_pose_clutch_bridge.cpp
+├── xrobotoolkit_pxrea_adapter.cpp
+├── pose_target_demo.cpp
+└── xr_pose_demo.cpp
+~~~
 
 ---
 
-## 阶段 1：建立干净的 C++/ROS 2 工程骨架
+## 3. MuJoCo 仿真架构
 
-### 任务
+### 3.1 启动配置
 
-- 创建新的 `ros2_ws/src` 包结构，不复制旧 TeleVision 运行逻辑。
-- 建立 `qiling_interfaces`、`qiling_description`、`qiling_kinematics`、`qiling_teleop_controller` 和 `qiling_bringup` 空包。
-- 设置 C++17、统一 warning、clang-format 和基础静态检查。
-- 配置 rosdep、colcon build 和单元测试入口。
-- 将 XRoboToolkit、Pinocchio、ProxQP、Eigen 的版本记录在 `third_party/README.md`。
-- 建立 CI 或本机一键构建脚本，但不把 Conda 混入 ROS 构建。
+当前配置文件：
 
-### 验收门槛
+~~~text
+src/mujoco_simulator/config/simulate.yaml
+~~~
 
-- 全新 shell 中 source ROS 2 后可完整 `colcon build`。
-- `colcon test` 可执行并产生测试报告。
-- 启动空 bringup 不产生重复节点或 TF 发布者。
+核心配置如下：
 
----
+~~~yaml
+modelPath: package://qi_robot_description/new_scene/scene_S4_40DOF_fullbody.xml
+modelName: scene_S4_40DOF_fullbody
+lowStateTopic: /human_lower_state
+jointCommandsTopic: /human_lower_command
+qposTopic: /mujoco/qpos
+unPauseService: /unpause_mujoco
+initPauseFlag: true
+modelTableFlag: true
+fixedBase: true
+freezeLegs: true
+startupKeyframe: teleop_start
+targetKeyframe: teleop_home
+homeTransitionEnabled: true
+homeTransitionKeyframes: [teleop_start, teleop_elbow_lift, teleop_shoulder_rear, teleop_home]
+homeTransitionDurations: [0.8, 1.0, 1.2]
+homeTransitionKp: 35
+homeTransitionKd: 4
+homeHoldKp: 30
+homeHoldKd: 4
+~~~
 
-## 阶段 2：机器人模型和只读状态链路
+### 3.2 MuJoCo 维度和控制范围
 
-### 任务
+当前场景实际维度：
 
-- 将 URDF 放入 `qiling_description`。
-- 用 Pinocchio 和 `robot_state_publisher` 分别加载同一 URDF。
-- 验证 joint 名称、顺序、零位、方向、上下限和单位。
-- 实现 `qiling_robot_adapter` 的只读状态映射。
-- 实现 O6 只读状态映射。
-- 用 RViz 显示真实机器人关节状态。
-- 建立关节状态录制样例供后续离线测试。
+- nq = 47。
+- nv = 46。
+- nu = 40。
+- MuJoCo 仿真步长为 0.001 秒，即 1 kHz。
+- 外部 ROS 2 控制接口按 50 Hz 使用。
 
-### 验收门槛
+这三个维度不能混淆：
 
-- 真实关节运动方向与 RViz 完全一致。
-- Pinocchio FK 与 TF/RViz 中末端位姿在容差内一致。
-- 缺失、重复或未知 joint name 会明确报错并阻止使能。
-- 连续运行 30 分钟无状态断流或顺序漂移。
+- nq 是广义位置数量，包含浮动基座的 7 个 qpos。
+- nv 是广义速度数量，浮动基座速度为 6 个量。
+- nu 是执行器数量，当前 /human_lower_command 要求 40 个控制槽。
 
----
+### 3.3 固定 base_link
 
-## 阶段 3：三相机稳定采集
+第一阶段固定机器人基座：
 
-### 任务
+1. MuJoCo 启动后记录浮动基座的初始 qpos。
+2. 每个仿真更新周期将基座 qpos 恢复为初始值。
+3. 将浮动基座对应的 6 个速度置零。
+4. 不对基座求 IK，不向基座施加移动控制。
 
-- 分别启动 D435、左右 D405，固定 serial 和 namespace。
-- 只开启需要的 RGB stream。
-- 再同时启动三台相机，检查 USB 带宽、CPU 和丢帧。
-- 明确各相机时间戳 domain。
-- 生成 10 分钟三相机录制样例。
-- 标定并记录腕部相机到对应末端 frame 的外参；头部相机标定到头/基座相关 frame。
+这样做的目的：
 
-### 验收门槛
+- 使双臂遥操问题成为以 base_link 为参考的双臂局部控制问题。
+- 避免腿部和全身动力学暂时影响双臂位姿验证。
+- 让 MuJoCo、Pinocchio 和真实机器人第一版的参考坐标系保持一致。
 
-- 三路图像 topic 身份始终正确。
-- 同时运行 30 分钟无设备重连。
-- 每路实际 FPS 达到配置值，丢帧率处于可接受范围。
-- 图像时间戳单调递增。
+### 3.4 冻结腿部
 
----
+第一阶段腿部只显示、不控制：
 
-## 阶段 4：Quest 与 XRoboToolkit 最小链路
+1. 根据关节名称找到腿部 12 个关节。
+2. 记录每个腿部关节在启动或关键帧中的 qpos。
+3. 每个仿真周期恢复腿部 qpos。
+4. 将腿部速度置零。
+5. 忽略 /human_lower_command 中腿部对应的命令槽。
+6. 腿部执行器不参与有效外部控制。
 
-### 任务
+必须保留完整 40 维消息接口，不能把消息截断成只有双臂 14 维；但在第一阶段，腿部命令的内容不产生控制效果。
 
-- 构建并安装 XRoboToolkit Quest Unity Client。
-- 在机器人主机运行 XRoboToolkit PC Service。
-- 运行官方 C++ 示例或最小 callback 程序，输出 head/left/right pose 与 tracking validity。
-- 实现 `qiling_xr_bridge`，将网络 callback 转成结构化 ROS 2 `XRFrame`。
-- 统计 Quest 更新率、网络延迟、重复帧、乱序和断连行为。
-- 实现头部 D435 RGB 到 Quest 的最小视频显示。
-- 验证 Quest 应用暂停、摘下头显、tracking 丢失和网络断开场景。
+### 3.5 home 过渡机制
 
-### 验收门槛
+仿真不应在解除暂停后直接把双臂瞬移到最终 home。当前采用多关键帧的平滑过渡：
 
-- 连续 30 分钟收到稳定 XR 数据。
-- C++ callback 不发生内存增长或线程阻塞。
-- ROS 2 中只保留最新 XR frame，不形成积压。
-- tracking validity 能正确反映控制器/手部丢失。
-- Quest 中可持续看到 D435 画面，视频异常不影响 XR 控制数据。
+~~~text
+teleop_start
+      |
+      | 0.8 s
+      v
+teleop_elbow_lift
+      |
+      | 1.0 s
+      v
+teleop_shoulder_rear
+      |
+      | 1.2 s
+      v
+teleop_home
+~~~
 
----
+过渡采用关节空间 PD：
 
-## 阶段 5：坐标变换、clutch 与缩放
+- homeTransitionKp = 35。
+- homeTransitionKd = 4。
+- 目标关键帧之间进行时间插值。
+- 进入最终 home 后使用 homeHoldKp = 30、homeHoldKd = 4 保持。
+- 过渡阶段外部命令暂不覆盖 home 控制。
+- 只有过渡完成后才进入遥操命令控制。
 
-### 任务
+当前 home 关节值已经按照最新确认值修改为：
 
-- 写出 XRoboToolkit/OpenXR 的坐标轴定义并做实测确认。
-- 实现 XR 到 `robot_base` 的固定旋转和尺度映射。
-- 实现左右臂相对锚点、clutch、重新定位和 tracking origin 重置处理。
-- 用 RViz marker 显示左右末端目标，不连接机器人控制。
-- 对平移 X/Y/Z 和绕各轴旋转逐项做方向测试。
-- 实现目标速度限制，避免手部 tracking 跳变直接形成大 pose step。
+关节顺序：
 
-### 验收门槛
+~~~text
+shoulder_pitch
+shoulder_roll
+shoulder_yaw
+elbow
+wrist_roll
+wrist_pitch
+wrist_yaw
+~~~
 
-- 操作者向前/后/左/右/上/下运动时，RViz 目标方向全部正确。
-- 松开并重新 clutch 后目标无跳变。
-- Quest 重置边界/原点后控制器拒绝继续输出，直到重新锚定。
-- 四元数连续，无 `q` 与 `-q` 导致的虚假跳变。
+左臂：
 
----
+~~~text
+-0.45,  0.30, 0.02, -1.40, 1.40, 0.0, 0.0
+~~~
 
-## 阶段 6：Pinocchio FK、Jacobian 和单臂差分 IK
+右臂：
 
-### 任务
+~~~text
+-0.45, -0.30, 0.02, -1.40, 1.40, 0.0, 0.0
+~~~
 
-- 实现独立于 ROS 的 `qiling_kinematics` C++ 库。
-- 加载 URDF，缓存 model/data/frame IDs 和关节映射。
-- 对 FK、末端 frame 和 Jacobian 做单元测试。
-- 用有限差分验证 Jacobian。
-- 实现 SE(3) pose error 和 twist 限幅。
-- 使用 ProxQP 实现左臂 7DoF 单臂 QP。
-- 增加关节限位、速度限位、阻尼、平滑和 nominal posture。
-- 对固定输入、轨迹输入、奇异点附近输入做离线 benchmark。
+当前 home 的手指槽位为 0，即手部处于打开或中性位置，具体手指方向以模型的零位定义为准。
 
-### 验收门槛
+当前 home 的设计目标：
 
-- FK 与参考结果一致。
-- Jacobian 有限差分误差处于设定容差内。
-- 随机可达目标求解稳定且不越限。
-- 不可达目标通过限速/松弛平滑逼近，不产生 NaN 或大跳变。
-- 单臂 IK P99 满足控制预算。
+- 双手掌心大致相对。
+- 肘部向外侧偏，不向身体中线夹入。
+- 肘部高度不过高。
+- 双手高度高于桌面。
+- 通过抬肘、后收肩部的中间关键帧避免双臂直接一字张开。
+- 过渡路径不碰撞桌面。
 
----
+注意：最终使用上述精确关节值后，应以 MuJoCo 实际 FK 结果为准，而不是只看关节数值。当前 FK 检查得到的大致结果是：
 
-## 阶段 7：双臂联合 QP 与拟人化次级任务
+~~~text
+左手末端位置约为 ( 0.3895,  0.3116, 1.3183)
+右手末端位置约为 ( 0.3880, -0.3228, 1.3214)
+左肘位置约为     ( 0.1022,  0.3328, 1.2450)
+右肘位置约为     ( 0.1010, -0.3328, 1.2445)
+~~~
 
-### 任务
+因此后续验证时需要同时观察：
 
-- 将决策变量扩展到双臂 14DoF。
-- 同时加入左右末端任务。
-- 使用每条手臂独立 nominal posture 和肘部偏好。
-- 加入关节限位 margin、速度和加速度约束。
-- 加入 QP slack 并定义不可行判定。
-- 评估独立双臂求解与联合求解结果；正式接口保持联合求解能力。
-- 后续按需要增加双臂/躯干碰撞距离线性化约束。
-- 用记录的 XR 轨迹离线回放，统计耗时、残差和连续性。
+- 末端位置是否在桌面上方。
+- 左右掌心法向是否相对。
+- 左右肘是否向外。
+- 过渡过程中是否与桌面或身体碰撞。
 
-### 验收门槛
+### 3.6 MuJoCo 命令优先级
 
-- 两臂同时移动时均能达到可达目标且无明显相互干扰。
-- 单臂静止时，另一臂运动不会使静止臂漂移。
-- 肘部动作连续，不频繁翻转冗余构型。
-- QP P99 和完整计算预算满足第 8.4 节目标。
-- 连续失败能被稳定识别，不会输出危险目标。
+当前仿真控制优先级应保持如下顺序：
 
----
+~~~text
+冻结腿部
+  >
+home 过渡
+  >
+home 保持
+  >
+外部 MIT 命令
+  >
+执行器控制范围裁切
+~~~
 
-## 阶段 8：安全控制器与虚拟机器人闭环
+当没有收到有效外部命令时，系统不应继续使用上一帧旧命令慢慢漂移。应满足：
 
-### 任务
-
-- 实现完整安全状态机。
-- 建立 mock robot adapter，以 50 Hz 接受 joint target 并返回模拟状态。
-- 将 XR、相对目标、双臂 IK、限幅和 mock 状态闭环连接。
-- 实现所有 watchdog、使能、禁用、fault 和 reset 行为。
-- 记录并回放断网、状态过期、tracking 丢失、QP 失败和异常值测试。
-- 确认控制器只在自己的 50 Hz tick 发布，不跟随 XR callback 直接发布。
-
-### 验收门槛
-
-- 10,000 次自动 fault injection 均进入预期状态。
-- 所有断连都不会继续发送累积目标。
-- 状态恢复后不会自动重新进入 `TELEOP`。
-- mock 闭环连续运行 1 小时无 deadline 持续丢失。
-
----
-
-## 阶段 9：真实手臂低速接入
-
-### 任务
-
-- 在 `qiling_robot_adapter` 中对接现有 ROS 2 SDK。
-- 先只发送“保持当前位置”目标。
-- 验证发布频率严格不超过 50 Hz。
-- 先左臂、再右臂、最后双臂。
-- 初始限制为小工作空间、低线速度、低角速度和小关节步长。
-- 验证 SDK 超时、节点退出、ROS 2 断连和急停行为。
-- 对比实际关节跟随与高层 `q_target`，但不把 MIT 命令加入训练 schema。
-
-### 验收门槛
-
-- 使能时无关节跳变。
-- 单臂各方向动作与 Quest 一致。
-- 双臂运行时不超过 SDK 50 Hz 上限。
-- tracking 丢失、节点崩溃和网络断开均触发预定安全行为。
-- 物理急停在全部软件状态下有效。
+- home 过渡未开始：保持启动姿态。
+- home 过渡进行中：执行过渡 PD。
+- home 过渡完成但没有遥操激活：保持 home。
+- 遥操 clutch 松开：差分 IK 进入 hold，并将该侧目标重置为当前测量关节姿态。
+- 输入超时：停止追踪目标并保持当前姿态，不能继续积分。
 
 ---
 
-## 阶段 10：O6 遥操作接入
+## 4. Pinocchio 双臂模型和关节映射
 
-### 任务
+### 4.1 IK 使用的模型
 
-- 实现 Quest 手骨架到 O6 高层 action 的映射。
-- 完成左右手独立标定。
-- 先在可视化或假 O6 adapter 中验证。
-- 再在真实 O6 上以低速、限幅方式测试。
-- 将 O6 和双臂 action 放入同一个 50 Hz 逻辑快照。
-- 定义手部 tracking 丢失后的安全手型。
+实际 Pinocchio 控制模型固定使用：
 
-### 验收门槛
+~~~text
+/home/ub/project/qiling_television/src/qi_robot_description/urdf/s4_dual_arm.urdf
+~~~
 
-- 关键手型方向和幅度正确。
-- O6 命令无高频振荡、突跳或越限。
-- 左右手可以与双臂同时稳定运行。
-- 录制 action 与 O6 adapter 接收的高层目标一致。
+该模型不是完整 40DOF 全身模型，而是专门为第一阶段双臂差分 IK 准备的 14 关节模型。
+
+初始化时必须检查：
+
+~~~text
+model.nq == 14
+model.nv == 14
+~~~
+
+如果维度不满足，应直接报错退出，禁止静默运行，因为关节索引错位会导致非常危险的控制结果。
+
+### 4.2 双臂关节顺序
+
+左臂：
+
+~~~text
+0 left_shoulder_pitch_joint
+1 left_shoulder_roll_joint
+2 left_shoulder_yaw_joint
+3 left_elbow_joint
+4 left_wrist_roll_joint
+5 left_wrist_pitch_joint
+6 left_wrist_yaw_joint
+~~~
+
+右臂：
+
+~~~text
+0 right_shoulder_pitch_joint
+1 right_shoulder_roll_joint
+2 right_shoulder_yaw_joint
+3 right_elbow_joint
+4 right_wrist_roll_joint
+5 right_wrist_pitch_joint
+6 right_wrist_yaw_joint
+~~~
+
+ROS 2 /joint_states 的排列顺序不能假定与上述顺序相同。当前实现必须通过 JointState.name 按关节名称建立映射，然后再填充 Pinocchio 的 q。
+
+### 4.3 末端 frame
+
+默认左右末端 frame：
+
+~~~text
+LH_hand_base_link
+RH_hand_base_link
+~~~
+
+兼容回退 frame：
+
+~~~text
+left_wrist_yaw_link
+right_wrist_yaw_link
+~~~
+
+启动时必须打印最终使用的 frame ID，并检查：
+
+- frame 存在。
+- frame 属于双臂模型。
+- 左右末端不是同一个 frame。
+- 当前 q 下 FK 的末端位姿是有限数。
+
+### 4.4 Pinocchio 每周期计算
+
+每个控制周期的计算顺序：
+
+1. 读取最新的 /joint_states。
+2. 根据关节名形成 q。
+3. 调用 forwardKinematics。
+4. 调用 computeJointJacobians。
+5. 调用 updateFramePlacements。
+6. 读取左右末端当前 SE(3) 位姿。
+7. 读取左右末端 LOCAL frame Jacobian。
+8. 计算当前位姿到目标位姿的 SE(3) 误差。
+9. 构建两侧 QP。
+10. 用上一周期解 warm-start。
+11. 约束 qdot。
+12. 积分得到 q_target。
+13. 将双臂目标写入 40 维 MITJointCommands。
 
 ---
 
-## 阶段 11：原始 Episode Recorder
+## 5. 当前差分 IK 方案
 
-### 任务
+### 5.1 选择差分 IK 的原因
 
-- 实现 start/stop/discard 和 task 输入。
-- 使用严格 topic 白名单，不录制全部 ROS 图。
-- 每个 episode 写入独立目录或 bag。
-- 写入配置、标定和代码版本标识。
-- 结束 episode 时生成摘要：时长、消息数、FPS、时间戳范围和丢帧。
-- discard 使用可恢复或明确范围的删除方式，不影响其他 episode。
-- 图像写盘压力测试与控制 deadline 同时进行。
+手柄输入天然是连续位姿变化，不是一次性求一个离散关节解。因此当前采用：
 
-### 验收门槛
+~~~text
+目标末端位姿
+    |
+    v
+SE(3) 位姿误差
+    |
+    v
+期望笛卡尔速度
+    |
+    v
+Pinocchio 雅可比
+    |
+    v
+ProxQP 求关节速度 qdot
+    |
+    v
+积分 q_target
+    |
+    v
+关节 PD/MIT 命令
+~~~
 
-- 录制开始/结束不改变机器人使能状态。
-- 原始 episode 中仅包含白名单字段和必要元数据。
-- 三路图像、state、action、O6 state 都有单调时间戳。
-- 30 分钟录制不会影响 50 Hz 控制指标。
-- 不完整 episode 能被检测并拒绝转换。
+差分 IK 的核心形式是：
+
+~~~text
+e = log6(current_pose.inverse() * target_pose)
+
+v_des = [position_gain * e_position,
+         rotation_gain * e_rotation]
+
+Jw = [sqrt(position_weight) * J_position,
+      sqrt(rotation_weight) * J_rotation]
+
+minimize 0.5 * ||Jw * qdot - vw_des||^2
+       + 0.5 * damping * ||qdot||^2
+       + posture term
+~~~
+
+其中 qdot 为 7 维关节速度。
+
+### 5.2 当前 ProxQP 约束
+
+当前每条手臂建立独立的 7 维 QP：
+
+- 变量：左侧或右侧 7 个关节速度。
+- 上下界：每个关节的 qdot lower / upper。
+- 不使用两臂之间的耦合等式约束。
+- 求解器使用上一周期结果进行 warm-start。
+- 使用稠密 LDLT 线性代数路径。
+- QP 失败时保持该侧目标，不发布危险的无效结果。
+
+关节速度上界同时考虑：
+
+1. 全局最大关节速度。
+2. 当前 q 到 URDF 关节上下限之间的距离。
+3. joint_limit_margin。
+4. 控制周期 dt。
+
+积分形式：
+
+~~~text
+q_target(k+1) = clamp(q_target(k) + qdot(k) * dt,
+                       q_min + margin,
+                       q_max - margin)
+~~~
+
+### 5.3 当前默认参数
+
+配置文件：
+
+~~~text
+src/qiling_kinematics/config/differential_ik.yaml
+~~~
+
+当前主要参数：
+
+~~~yaml
+control_rate_hz: 50
+target_frame: base_link
+target_timeout_sec: 0.25
+position_gain: 3.0
+rotation_gain: 3.0
+position_weight: 1.0
+rotation_weight: 0.80
+damping: 0.02
+posture_weight: 0.0
+joint_limit_margin: 0.08
+max_joint_velocity: 1.5
+max_position_error: 0.25
+max_rotation_error: 1.2
+command_kp: 40.0
+command_kd: 2.0
+qp_max_iter: 80
+qp_eps_abs: 1e-5
+~~~
+
+第一阶段调参顺序：
+
+1. 先确认坐标系和末端 frame 正确。
+2. 再确认 q 与 /joint_states 一致。
+3. 再确认目标不动时 q_target 不漂移。
+4. 再调位置误差增益和最大速度。
+5. 再调旋转误差增益和旋转速度。
+6. 最后才调整阻尼、关节限位边界和 posture term。
+
+不能在坐标系尚未验证时通过增益调参掩盖方向错误。
+
+### 5.4 当前 IK 的重要行为约定
+
+1. 控制模式 0 表示 hold。
+2. 非 0 模式表示 active。
+3. 模式 2 目前仅作为兼容值，不代表独立的姿态控制模式。
+4. 当前目标是统一的 6D 位姿目标，平移和旋转同时生效。
+5. clutch 松开后，该侧目标重置到当前机器人末端状态。
+6. 目标超时后，全部目标重置为当前测量姿态并保持。
+7. q_target 只在收到第一帧有效 JointState 时初始化，不能每帧用测量 q 覆盖。
+8. 只有位姿目标持续有效且对应侧 active 时才允许积分。
+9. 没有 active 目标时不能继续沿用旧 qdot 积分。
+
+### 5.5 现有 IK 方案的局限
+
+当前实现已经可以完成双臂位姿闭环，但仍不是完整的高质量全身控制器：
+
+- 两条手臂相互独立，未处理双手协同约束。
+- 没有碰撞约束。
+- posture_weight 默认是 0，没有主动避奇异位形的 null-space 目标。
+- 没有显式的末端线速度、角速度平滑器。
+- 目标位姿和 q_target 的安全边界还需要在真实机器人上重新标定。
+- O6 尚未接入最终命令合并链路。
+- 当前 MITJointCommands 初始化为 40 个零槽，后续必须明确 O6 和腿部命令的唯一来源。
 
 ---
 
-## 阶段 12：LeRobot v3 离线转换器
+## 6. Quest 3 / XRoboToolkit 输入链路
 
-### 任务
+### 6.1 PC Service
 
-- 在 Conda Python 3.10 中锁定 LeRobot v3 依赖。
-- 读取原始 episode 和 metadata。
-- 建立统一目标时间轴并对齐三路图像、state 和 action。
-- 按固定关节/O6 顺序构建 `observation.state`。
-- 将左右 `xyz + quaternion` 和 O6 target 构建为 `action`。
-- 创建 task、episode、frame、timestamp 和数据集 metadata。
-- 输出时间对齐报告、缺帧报告和 feature schema。
-- 实现数据集加载、随机帧可视化和完整 episode 回放。
-- 用官方 LeRobot API 重新打开输出数据集进行验证。
+当前 PC 端已经安装：
 
-### 验收门槛
+~~~text
+XRoboToolkit_PC_Service_1.0.0_ubuntu_22.04_amd64.deb
+~~~
 
-- 输出能够被目标 LeRobot 版本正常加载。
-- feature 维度、dtype、图像尺寸和 FPS 与 metadata 一致。
-- 任意抽取一帧都能追溯到原始 episode 时间戳。
-- 可视化中三路图像、实际状态和 action 时间一致。
-- 最终数据集中不存在 MIT 命令或其他明确排除字段。
-- 同一输入重复转换得到相同帧数和相同数值结果。
+服务脚本：
+
+~~~text
+/opt/apps/roboticsservice/runService.sh
+~~~
+
+启动 PC Service 后，Quest 3 客户端连接到该服务。当前已确认左右手柄能够连接并控制双臂，说明：
+
+- Quest 3 与 PC Service 的连接可用。
+- PXREA SDK 动态库可加载。
+- 手柄 pose 回调可收到。
+- 左右手柄输入能够进入 ROS 2 适配器。
+
+### 6.2 PXREA SDK 适配器
+
+源文件：
+
+~~~text
+src/qiling_kinematics/src/xrobotoolkit_pxrea_adapter.cpp
+~~~
+
+SDK 文件：
+
+~~~text
+/opt/apps/roboticsservice/SDK/include/PXREARobotSDK.h
+/opt/apps/roboticsservice/SDK/x64/libPXREARobotSDK.so
+~~~
+
+当前适配器：
+
+1. 初始化 PXREA SDK。
+2. 注册 PXREADeviceStateJson 回调。
+3. 解析回调中的 JSON envelope。
+4. 解析 value.Controller.left 和 value.Controller.right。
+5. 读取 pose、trigger、grip、primaryButton。
+6. 以 90 Hz 发布 ROS 2 数据。
+
+发布话题：
+
+~~~text
+/xr/left_controller_pose   geometry_msgs/PoseStamped
+/xr/right_controller_pose  geometry_msgs/PoseStamped
+/xr/controller_joy         sensor_msgs/Joy
+~~~
+
+pose frame_id：
+
+~~~text
+xr_origin
+~~~
+
+当前 Joy 数组约定：
+
+~~~text
+axes[0]    左扳机 trigger
+axes[1]    右扳机 trigger
+axes[2]    左握把 grip
+axes[3]    右握把 grip
+
+buttons[0] 左 primary / X
+buttons[1] 右 primary / A
+buttons[4] 左 Grip 数字按键
+buttons[5] 右 Grip 数字按键
+~~~
+
+当前适配器尚未解析 Quest 手部骨骼或 O6 所需的手指关节信息。O6 需要另行从 SDK 或现有 O6 工作空间接入。
+
+### 6.3 clutch 逻辑
+
+源文件：
+
+~~~text
+src/qiling_kinematics/src/xr_pose_clutch_bridge.cpp
+~~~
+
+输入：
+
+~~~text
+/xr/left_controller_pose
+/xr/right_controller_pose
+/xr/controller_joy
+/teleop/left_wrist_state
+/teleop/right_wrist_state
+~~~
+
+输出：
+
+~~~text
+/teleop/left_wrist_target
+/teleop/right_wrist_target
+/teleop/left_control_mode
+/teleop/right_control_mode
+~~~
+
+每侧独立使用对应手柄 Grip：
+
+- 左 Grip 控制左臂 clutch。
+- 右 Grip 控制右臂 clutch。
+- 松开 Grip：该侧进入 hold。
+- 再按下 Grip：记录新的 XR anchor 和 robot anchor。
+- 按住 Grip：输出相对于 anchor 的 6D 位姿增量。
+- X/A 当前不作为姿态/平移模式切换键。
+
+按下瞬间的重定位逻辑：
+
+~~~text
+robot_anchor = 当前机器人末端位姿
+xr_anchor    = 当前手柄位姿
+
+之后：
+relative_xr = inverse(xr_anchor) * xr_current
+target      = robot_anchor * mapped(relative_xr)
+~~~
+
+这样可以避免操作者手柄当前所在位置与机器人手腕当前所在位置不一致时发生瞬移。
+
+### 6.4 输入超时和失效安全
+
+当前建议并应保持的超时：
+
+- XR pose 超时：0.20 秒。
+- Joy 超时：0.20 秒。
+- 机器人末端状态超时：0.20 秒。
+- 差分 IK 目标超时：0.25 秒。
+
+超时处理：
+
+1. 立刻停止该侧 active 状态。
+2. 将目标冻结在最新有效机器人位姿。
+3. 向 IK 发布 hold 模式。
+4. 禁止继续积分旧的目标速度。
+5. 恢复有效输入后，需要重新 clutch 建立 anchor。
 
 ---
 
-## 阶段 13：整机性能、鲁棒性和操作验收
+## 7. 坐标系和方向映射
 
-### 任务
+### 7.1 坐标系定义
 
-- 同时运行 Quest、三相机、双臂、O6 和 recorder。
-- 测量 XR packet age、IK 时延、控制 tick、SDK 发布频率、图像 FPS 和写盘吞吐。
-- 做至少 30 分钟连续遥操作与录制。
-- 做故障注入：Quest 断网、头显休眠、单相机断开、ROS 节点退出、状态过期、QP 不可行、磁盘空间不足。
-- 测量视频 motion-to-photon 和操作者主观可用性。
-- 检查 CPU 核心占用、内存增长、温度和网络抖动。
-- 根据结果决定是否设置线程优先级、CPU affinity 或实时内核；这些优化必须基于测量，而不是默认开启。
-- 编写 `docs/operations.md`：开机、标定、使能、录制、停止、急停和故障恢复。
+当前映射的基础假设：
 
-### 最终验收
+XRoboToolkit / XR 输入坐标：
 
-- 双臂和 O6 可由 Quest 连续稳定遥操作。
-- SDK 外部命令频率不超过 50 Hz。
-- 失联、越限和 IK 失败不会持续输出危险目标。
-- 三路 RGB、实际状态和 EE/O6 action 可形成完整 episode。
-- episode 可稳定转换并加载为 LeRobot Dataset v3。
-- 运行 30 分钟不出现控制 deadline 持续丢失、明显内存泄漏或相机身份交换。
-- 操作人员能按文档从冷启动完成一次录制和转换。
+~~~text
+X：右
+Y：上
+Z：前 / 朝向操作者前方
+~~~
 
-## 15. 测试矩阵
+机器人 base_link：
 
-| 层级 | 测试内容 | 是否需要硬件 |
-|---|---|---|
-| Unit | 坐标变换、四元数、关节映射、限位 | 否 |
-| Unit | Pinocchio FK/Jacobian、QP 约束 | 否 |
-| Unit | 时间对齐、state/action 拼接 | 否 |
-| Integration | 记录的 XR 输入 -> RViz target | 否 |
-| Integration | XR -> IK -> mock robot | 否 |
-| Integration | rosbag2 -> LeRobot v3 | 否 |
-| HIL | Quest -> PC Service -> ROS 2 | Quest |
-| HIL | 三台 RealSense 同时运行 | 相机 |
-| HIL | 单臂低速跟随 | 单臂 |
-| HIL | 双臂低速跟随 | 双臂 |
-| HIL | O6 手型映射 | O6 |
-| System | 双臂 + O6 + 三相机 + recorder | 全部 |
-| Safety | 断网、过期、求解失败、急停 | 全部 |
+~~~text
+X：前
+Y：左
+Z：上
+~~~
 
-## 16. 关键指标与观测方式
+当前基础轴变换矩阵：
 
-| 指标 | 采样位置 | 输出 |
-|---|---|---|
-| XR 更新频率 | `qiling_xr_bridge` | Hz、重复/乱序帧数 |
-| XR 样本年龄 | 控制 tick 读取时 | mean/P95/P99/max |
-| IK 耗时 | ProxQP solve 前后 | mean/P95/P99/max |
-| 控制 tick 耗时 | 50 Hz 循环入口/出口 | mean/P95/P99/max |
-| SDK 发布频率 | robot adapter | Hz、deadline miss |
-| 相机 FPS | 各 image topic | Hz、drop count |
-| 数据同步误差 | 离线 converter | 每源时间差分布 |
-| 视频延迟 | 相机时间到 Quest 显示 | P50/P95 |
-| 数据完整性 | 每 episode 结束 | 消息数、时长、缺失源 |
+~~~text
+M =
+  [ 0   0   1
+   -1   0   0
+    0   1   0 ]
+~~~
 
-高频统计放入内存环形缓冲，按周期输出汇总，不能在每个控制 tick 打印日志。
+该矩阵的行列含义必须在代码中保持一致，并在启动日志中打印。由于当前 XR 与机器人手性和轴定义存在差异，不能只用一个简单的 quaternion 乘法解决全部方向问题。
 
-## 17. 风险与提前决策
+### 7.2 当前平移修正
 
-### 风险 1：Quest 型号不在官方验证范围
+根据已进行的手柄实测：
 
-- Quest 3：按官方客户端路线。
-- 其他 Quest：阶段 4 先做兼容性 spike，未通过前不进入机器人控制。
+- Y、Z 平移方向基本正确。
+- X 平移曾经相反，因此当前 X 平移需要取反。
+- 左手 Y 方向需要额外取反。
+- 右手 Y 方向保持当前映射。
 
-### 风险 2：D435 不是彩色立体相机
+当前桥接配置：
 
-- 第一版使用单目面板或双眼复制。
-- 真实双目彩色体验作为后续硬件升级，不阻塞数据采集。
+~~~yaml
+robot_translation_axis_sign_x: -1
+robot_translation_axis_sign_y: 1
+robot_translation_axis_sign_z: 1
+left_robot_translation_axis_sign_y: -1
+right_robot_translation_axis_sign_y: 1
+~~~
 
-### 风险 3：机器人 URDF 与 SDK joint 顺序不一致
+因此使用左右手柄时，必须分别验证，不能只验证右手后假设左手自动正确。
 
-- 所有映射按 joint name 显式配置。
-- 任何缺失/重复 name 都阻止使能。
+### 7.3 当前旋转修正
 
-### 风险 4：QP 加入碰撞后超时或不可行
+当前旋转处理不是把四元数分量逐个取反，而是：
 
-- 先完成无复杂碰撞的双臂版本。
-- 碰撞约束分阶段加入，使用 slack、固定最大约束规模和 warm start。
-- 任何优化都以本体主机 P99 数据为依据。
+1. 计算手柄相对于 XR anchor 的相对旋转。
+2. 用基础轴变换和 robot anchor 方向构造局部 basis change。
+3. 使用共轭变换把相对旋转变换到机器人参考方向。
+4. 将旋转矩阵转换成轴角向量。
+5. 应用旋转轴方向和统一旋转比例。
+6. 与 robot anchor 组合得到目标姿态。
 
-### 风险 5：ROS 2、XR、相机时间源不一致
+当前旋转参数：
 
-- 原始数据保留 source stamp 和 receive stamp。
-- 转换器检测回退和漂移，不静默修正异常 episode。
+~~~yaml
+rotation_invert: true
+rotation_scale: 0.50
+max_rotation_rad: 2.50
+rotation_sign_x: -1
+rotation_sign_y: 1
+rotation_sign_z: 1
+~~~
 
-### 风险 6：图像录制影响控制实时性
+当前旋转速度曾经偏大，因此旋转比例必须先保持在 0.50 或更低，在实测中逐步增加。旋转限幅必须保留，防止 Quest 重连、追踪跳变或 anchor 异常导致目标瞬间跳跃。
 
-- 录制器独立进程。
-- 控制节点不做编码和磁盘 I/O。
-- 必要时设置 CPU affinity、降低图像尺寸或优化存储，但不得降低控制安全检查。
+### 7.4 坐标系验收动作
 
-### 风险 7：Conda 污染 ROS 2 C++ 运行环境
+每次修改映射后都必须单独执行以下动作，不允许凭整体运动感觉判断：
 
-- ROS 2 runtime 与 LeRobot converter 使用独立启动入口。
-- 控制链路从干净系统 shell 启动。
+平移：
 
-## 18. 每次实施迭代的固定流程
+~~~text
+左手柄向机器人 base_link +X 移动
+左手柄向 base_link -X 移动
+左手柄向 base_link +Y 移动
+左手柄向 base_link -Y 移动
+左手柄向 base_link +Z 移动
+左手柄向 base_link -Z 移动
+右手柄重复上述六项
+~~~
 
-每个阶段按以下顺序执行：
+旋转：
 
-1. 在文档中写清当前输入、输出、坐标系和失败行为。
-2. 先写离线单元测试或 mock。
-3. 实现最小功能。
-4. 在无机器人运动条件下验证。
-5. 收集频率、延迟和错误统计。
-6. 通过阶段验收后提交代码和配置。
-7. 更新 `docs/interfaces.md` 和对应操作文档。
-8. 再进入下一阶段。
+~~~text
+绕 base_link X 正转和反转
+绕 base_link Y 正转和反转
+绕 base_link Z 正转和反转
+左右手柄分别重复
+~~~
 
-每次涉及真实机器人运动时：
+每次只做一个自由度动作，其他方向尽量固定。记录：
 
-- 先只读；
-- 再保持当前位置；
-- 再单关节/单方向小范围；
-- 再单臂；
-- 最后双臂和 O6；
-- 始终保留物理急停和观察人员。
+- 手柄相对位移或旋转方向。
+- target PoseStamped 的变化。
+- current wrist state 的变化。
+- q_target 的变化。
+- 最终 MuJoCo 末端 frame 的变化。
 
-## 19. 开始实现前仍需提供的资料
+排查顺序必须是：
 
-这些资料不阻止建立工程骨架，但会阻止对应硬件阶段验收：
+~~~text
+XR 原始 pose
+  -> adapter 发布 pose
+  -> bridge 生成 target
+  -> IK 读取 target
+  -> Pinocchio current / target error
+  -> qdot
+  -> q_target
+  -> MuJoCo /joint_states
+~~~
 
-- Quest 具体型号。
-- 完整双臂 URDF、mesh 和 joint limit。
-- 左右 7 个关节名称及顺序。
-- `robot_base`、左右 EE frame 名称。
-- 手臂 SDK 的 ROS 2 message/topic/QoS 示例。
-- SDK 对 MIT 字段的必填要求、默认值和 watchdog 行为。
-- O6 控制和反馈消息定义、自由度、范围、单位和频率。
-- 三台 RealSense serial、目标分辨率/FPS。
-- 机器人主机硬件规格和 USB 拓扑。
+不能直接只改 IK 里的符号，因为错误可能出现在 XR 原始坐标、anchor 组合、桥接矩阵或 MuJoCo 末端 frame 定义。
 
-## 20. 推荐的首个实现切片
+---
 
-第一次编码只完成以下闭环，不连接机器人执行：
+## 8. 双臂统一位姿控制策略
 
-```text
-Quest
-  -> XRoboToolkit PC Service C++ callback
-  -> qiling_xr_bridge
-  -> 坐标转换和 clutch
-  -> Pinocchio + ProxQP 单臂 IK
-  -> RViz / mock robot
-```
+### 8.1 当前选定模式
 
-该切片通过后，再增加右臂、真实 SDK、O6、相机录制和 LeRobot 转换。这样每一步都有明确输入、输出和验收依据。
+当前不再使用平移和旋转分开控制，统一采用：
 
-## 21. 参考项目
+~~~text
+按住 Grip
+    |
+    v
+同时控制对应手腕的 3D 平移 + 3D 旋转
+~~~
 
-- [XRoboToolkit](https://xr-robotics.github.io/)
-- [XRoboToolkit C++ Teleop Sample](https://github.com/XR-Robotics/XRoboToolkit-Teleop-Sample-Cpp)
-- [XRoboToolkit Quest Unity Client](https://github.com/XR-Robotics/XRoboToolkit-Unity-Client-Quest)
-- [XRoboToolkit PC Service](https://github.com/XR-Robotics/XRoboToolkit-PC-Service)
-- [Unitree xr_teleoperate](https://github.com/unitreerobotics/xr_teleoperate)
-- [Pinocchio](https://github.com/stack-of-tasks/pinocchio)
-- [ProxQP / proxsuite](https://github.com/Simple-Robotics/proxsuite)
-- [LeRobot Dataset v3](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)
+原因：
+
+- 手柄本身提供完整 6DoF 输入。
+- 分开模式会造成操作者姿态意图和目标状态切换复杂。
+- 之前的“仅旋转但位置仍漂移”问题更适合通过目标构造和 IK 约束修复，而不是继续增加模式分支。
+
+### 8.2 为什么统一 6D 仍可能出现位置跟随
+
+即使目标 PoseStamped 的位置不变，位置仍可能变化，原因可能来自：
+
+1. 末端 frame 不在 wrist joint 的旋转中心。
+2. 姿态误差导致肩、肘、腕多个关节共同运动。
+3. QP 只有速度边界，没有严格位置等式约束。
+4. 雅可比使用了错误的 frame reference。
+5. 旋转和平移误差的权重不平衡。
+6. 7 自由度冗余在无 posture 目标时存在不同解。
+7. q_target 与实际 q 的同步或积分逻辑错误。
+
+因此当前 IK 验证必须区分两类指标：
+
+- 目标误差：current wrist 与 target wrist 的位置、旋转误差。
+- 非期望方向运动：操作者只旋转时末端位置变化量，操作者只平移时末端旋转变化量。
+
+### 8.3 后续用于减少耦合的改进顺序
+
+先做不改变求解器结构的改进：
+
+1. 确认 Pinocchio 使用 LOCAL / LOCAL_WORLD_ALIGNED 的一致性。
+2. 确认 Pose log6 的误差定义和目标组合顺序。
+3. 对目标 pose 进行有限差分测试。
+4. 对每一侧单独记录数值雅可比和解析雅可比。
+5. 增加 qdot 一阶低通或加速度限制。
+6. 增加 posture/null-space 项，使肘部偏向舒适 home。
+7. 增加姿态和平移的独立权重调节。
+8. 必要时采用加权阻尼最小二乘或带软约束的 QP。
+
+如果仍需严格保证位置和姿态在某种动作下完全不耦合，应增加任务优先级或硬等式约束；但这应在基础坐标系、frame 和 q 映射完全正确后进行。
+
+---
+
+## 9. O6 灵巧手控制接入方案
+
+### 9.1 已知条件
+
+- O6 控制已经在工作空间 /home/ub/project/qiling_grasp_ws 中存在参考实现。
+- O6 控制接口通过 ROS 2 话题暴露。
+- 真实机器人端已经实现 O6 控制。
+- O6 必须参与最终遥操。
+- 当前 MuJoCo 模型中双手每侧的手指执行器也占用 /human_lower_command 的槽位。
+
+### 9.2 必须先确认的接口
+
+在正式接入前，必须从 qiling_grasp_ws 和真实驱动中确认：
+
+1. O6 状态话题名称。
+2. O6 命令话题名称。
+3. 消息类型。
+4. 每只 O6 的关节数量。
+5. 关节名称和排列顺序。
+6. 角度单位，是弧度还是度。
+7. 控制值含义，是位置、速度、力矩还是归一化手指开合量。
+8. 消息是否需要 kp、kd、mode 或 enable 字段。
+9. 最高接收频率。
+10. 左右手 O6 是否使用相同的关节顺序。
+11. 失联时驱动如何处理。
+12. MuJoCo 中 O6 关节数量和真实 O6 接口数量是否一致。
+
+当前需要特别注意一个已知风险：早期实现中手部曾按每侧 6 个值考虑，而当前 MuJoCo 模型的 O6 关节槽位可能包含 7 个关节，例如 thumb_ip 等。因此不能直接复制旧的 6 维数组，必须以当前模型和真实 O6 接口的 joint name 为准建立显式 mapping。
+
+### 9.3 O6 输入来源
+
+Quest 手柄默认只能稳定提供：
+
+- 手柄 6DoF 位姿。
+- trigger。
+- grip。
+- X/A 等按键。
+
+这不足以直接生成完整灵巧手关节动作。O6 可采用的输入来源按优先级如下：
+
+方案 A：XRoboToolkit / Quest 手部骨骼数据
+
+- 如果 Quest 客户端和 SDK 能提供 hand tracking skeleton，则解析手指关节。
+- 将人体手指关节角映射到 O6 关节。
+- 需要左右手镜像、角度范围和手性校准。
+
+方案 B：手柄 trigger / 按键映射
+
+- trigger 映射拇指或整体抓取开合。
+- 按键映射若干离散抓取模式。
+- 适合先验证 O6 通信，不适合高质量模仿数据。
+
+方案 C：复用 qiling_grasp_ws 已有抓取模式
+
+- 在遥操桥接层发布 grasp mode。
+- O6 控制节点将模式转换成 O6 关节命令。
+- 适合当前已有的 O6 模式接口。
+
+第一阶段建议先采用 B 或 C 完成 MuJoCo/真实接口打通，再根据 Quest SDK 实际是否提供 skeleton 决定是否实现 A。
+
+### 9.4 命令合并原则
+
+最终必须只有一个节点向 /human_lower_command 发布 40 维命令，或者明确使用一个命令 mux；不能让差分 IK 节点和 O6 节点同时直接发布同一个话题。
+
+推荐结构：
+
+~~~text
+双臂 IK 目标 q
+        \
+         \
+          > qiling_command_mux -> /human_lower_command
+         /
+O6 目标 q
+        /
+腿部安全保持槽
+~~~
+
+命令 mux 负责：
+
+- 接收双臂 14 维目标。
+- 接收 O6 左右手目标。
+- 将腿部槽位填充为安全保持值或零值。
+- 按固定全局 joint map 写入 40 维命令。
+- 统一检查 finite、范围、时间戳和 freshness。
+- 统一在失效时进入 hold。
+- 统一记录用于调试的非训练数据。
+
+如果暂时不新增 mux，也必须在单个最终控制节点中完成上述合并，保证 /human_lower_command 只有一个 publisher。
+
+### 9.5 O6 与双臂控制频率
+
+由于手臂 SDK 最高接收频率为 50 Hz：
+
+- 差分 IK 主循环采用 50 Hz。
+- O6 命令可以在 50 Hz 发送，或在单独节点内部更高频更新后由 50 Hz mux 统一输出。
+- 对真实机器人不应超过 SDK 明确允许的接收频率。
+- MuJoCo 内部虽然以 1 kHz 运行，但 ROS 2 外部命令仍按 50 Hz 更新。
+
+---
+
+## 10. 当前运行链路和指令
+
+以下命令默认已 source ROS 2 Humble 和工作空间：
+
+~~~bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+~~~
+
+### 10.1 构建
+
+修改 C++ 后构建：
+
+~~~bash
+colcon build --symlink-install --packages-select qiling_kinematics mujoco_simulator mujoco_d435_publisher
+source install/setup.bash
+~~~
+
+如果只修改 XML、YAML 或 launch 文件，在当前 symlink-install 工作流下通常无需重新编译，但仍应重新 source 并检查 install 下的路径是否指向 source。
+
+### 10.2 启动 MuJoCo
+
+~~~bash
+ros2 launch mujoco_simulator simulate.launch.py
+~~~
+
+默认：
+
+- 启动时暂停。
+- 模型为 scene_S4_40DOF_fullbody.xml。
+- 固定 base。
+- 冻结腿部。
+- 解除暂停后执行多阶段 home 过渡。
+- 发布 /human_lower_state。
+- 发布 /joint_states。
+- 发布 /mujoco/qpos。
+
+解除暂停：
+
+~~~bash
+ros2 service call /unpause_mujoco std_srvs/srv/Trigger {}
+~~~
+
+也可以使用 MuJoCo 窗口中的播放/暂停操作；程序构造时已考虑通过 GUI 解除暂停后也触发 home 过渡。
+
+### 10.3 单独启动 MuJoCo D435
+
+当前仿真只有头部相机，因此单独启动：
+
+~~~bash
+ros2 launch mujoco_d435_publisher d435_camera.launch.py
+~~~
+
+主要输出：
+
+~~~text
+/camera/camera/color/image_raw
+/camera/camera/color/camera_info
+~~~
+
+当前 D405 尚未在 MuJoCo 场景中发布。后续若需要腕部观测，应补充：
+
+- MuJoCo 中的两个相机定义。
+- 相机 qpos 更新。
+- 左右腕部 frame。
+- 两个图像话题和 CameraInfo。
+- 录制器中的相机字段映射。
+
+### 10.4 启动纯 IK 演示
+
+~~~bash
+ros2 launch qiling_kinematics differential_ik.launch.py
+~~~
+
+该启动用于验证：
+
+- /joint_states 是否能映射到 Pinocchio。
+- 目标 PoseStamped 是否能驱动双臂。
+- /human_lower_command 是否符合 40 维要求。
+- IK 是否在 50 Hz 稳定运行。
+
+### 10.5 启动 XR 输入适配器
+
+先启动 PC Service：
+
+~~~bash
+/opt/apps/roboticsservice/runService.sh
+~~~
+
+然后启动 XRoboToolkit 适配器：
+
+~~~bash
+ros2 run qiling_kinematics qiling_xrobotoolkit_pxrea_adapter
+~~~
+
+检查：
+
+~~~bash
+ros2 topic echo /xr/left_controller_pose
+ros2 topic echo /xr/right_controller_pose
+ros2 topic echo /xr/controller_joy
+~~~
+
+### 10.6 启动 clutch 和位姿桥接
+
+~~~bash
+ros2 run qiling_kinematics qiling_xr_pose_clutch_bridge --ros-args \
+  --params-file src/qiling_kinematics/config/xr_pose_clutch_bridge.yaml
+~~~
+
+检查：
+
+~~~bash
+ros2 topic echo /teleop/left_wrist_target
+ros2 topic echo /teleop/right_wrist_target
+ros2 topic echo /teleop/left_control_mode
+ros2 topic echo /teleop/right_control_mode
+~~~
+
+### 10.7 一键真实 XR 仿真链路
+
+当前 real 命名的 launch 用于 XR → clutch → differential IK → MuJoCo 的闭环演示，启动前确保：
+
+1. PC Service 已启动。
+2. Quest 3 已连接。
+3. MuJoCo 已运行并解除暂停。
+4. MuJoCo 使用 teleop_home 完成 home 过渡。
+
+启动：
+
+~~~bash
+ros2 launch qiling_kinematics xr_teleop_real.launch.py
+~~~
+
+如果该 launch 同时启动仿真和适配器，应先查看 launch 内容确认是否会重复启动节点；系统最终应保证每个关键话题只有预期的 publisher。
+
+---
+
+## 11. 分阶段实施路线
+
+### 阶段 A：静态模型和接口基线
+
+目标：确保所有节点使用正确模型和正确维度。
+
+任务：
+
+1. 确认 qi_robot_description 被正确安装。
+2. 确认 MuJoCo 可以通过 package URI 加载 scene_S4_40DOF_fullbody.xml。
+3. 确认 scene 文件包含正确的完整机器人 XML。
+4. 检查 nq、nv、nu。
+5. 检查 d435_camera 名称。
+6. 检查 s4_dual_arm.urdf 的 nq、nv。
+7. 检查左右末端 frame。
+8. 检查所有 ROS 2 话题和消息类型。
+9. 检查 /human_lower_command 的 40 维要求。
+
+验收：
+
+- MuJoCo 正常启动。
+- 解锁后 home 过渡只执行一次。
+- 腿部固定。
+- base_link 固定。
+- /joint_states 稳定发布。
+- Pinocchio 节点可以加载模型且不报 frame/joint 错误。
+
+### 阶段 B：home 姿态和安全过渡
+
+目标：建立稳定、舒适、可重复的遥操起始姿态。
+
+任务：
+
+1. 验证最新 home 关节值已经写入 XML。
+2. 检查 teleop_start、teleop_elbow_lift、teleop_shoulder_rear、teleop_home 的 qpos 长度都是 47。
+3. 用 FK 检查四个关键帧的双手位置和左右肘位置。
+4. 检查整个插值路径的桌面碰撞。
+5. 如需要，调整中间关键帧，不改变最终 home 关节值。
+6. 检查最终双手掌心是否相对。
+7. 检查最终肘部是否向外而不是夹向身体。
+8. 检查解除暂停后外部命令不会跳过过渡。
+9. 检查暂停、继续、重启后状态一致。
+
+验收动作：
+
+- 连续启动 10 次，home 姿态一致。
+- 连续解除暂停 10 次，没有明显瞬移。
+- 过渡过程中双手不穿桌面。
+- 过渡结束后没有大幅振荡。
+
+### 阶段 C：Pinocchio FK 和状态映射
+
+目标：证明 IK 输入的 q 和 MuJoCo 当前姿态是同一个机器人姿态。
+
+任务：
+
+1. 订阅 /joint_states。
+2. 根据 name 建立左右臂索引。
+3. 转换到 Pinocchio q。
+4. 计算左右末端 FK。
+5. 发布 /teleop/left_wrist_state 和 /teleop/right_wrist_state。
+6. 将发布的末端状态与 MuJoCo viewer 中的末端位置对比。
+7. 在 home、随机姿态和单关节变化下对比。
+
+验收指标：
+
+- home 时 Pinocchio 和 MuJoCo 左右末端位置误差小于预设阈值。
+- 旋转误差小于预设阈值。
+- 单独改变某个关节时，Pinocchio 末端变化方向和 MuJoCo 一致。
+- 不存在左右手索引错位。
+
+### 阶段 D：ProxQP 差分 IK 单元测试
+
+目标：先不接 Quest，验证 IK 数学和数值稳定性。
+
+任务：
+
+1. 固定一个 q。
+2. 用 FK 产生当前末端 pose。
+3. 生成小幅平移目标。
+4. 生成小幅旋转目标。
+5. 生成同时平移和旋转目标。
+6. 检查 QP 输出 qdot 的方向。
+7. 检查 qdot 不超过速度边界。
+8. 检查积分后的 q_target 不越过关节限位。
+9. 检查目标不变时 qdot 逐渐趋近于零。
+10. 检查目标超时后停止积分。
+11. 人为制造 QP 失败，确认进入 hold。
+
+必须记录：
+
+- 每帧 q。
+- 左右末端 current pose。
+- 左右 target pose。
+- position error。
+- rotation error。
+- qdot。
+- q_target。
+- QP status。
+- solve time。
+
+### 阶段 E：MuJoCo 位姿闭环
+
+目标：不接 XR，使用程序生成的 PoseStamped 验证双臂位姿控制。
+
+任务：
+
+1. 只控制左臂。
+2. 只控制右臂。
+3. 双臂同时控制。
+4. 发送微小平移目标。
+5. 发送微小旋转目标。
+6. 发送持续圆周或小范围轨迹。
+7. 测试目标停止时是否停止漂移。
+8. 测试目标超时是否 hold。
+9. 测试目标跳变是否被限幅。
+
+重点观察：
+
+- 位置误差是否收敛。
+- 旋转误差是否收敛。
+- 只转动目标时位置是否产生非预期明显变化。
+- 只平移目标时姿态是否产生非预期明显变化。
+- 手腕、肘部、肩部是否有高频抖动。
+- MuJoCo Control 栏的关节命令是否异常跳变。
+
+### 阶段 F：Quest 3 原始输入验证
+
+目标：只验证输入，不接 IK。
+
+任务：
+
+1. 启动 PC Service。
+2. 连接 Quest 3。
+3. 启动 PXREA adapter。
+4. 检查左右 pose 的频率。
+5. 检查 Joy 的 axes 和 buttons。
+6. 检查断开、重连和 Quest 睡眠唤醒。
+7. 记录原始 pose 是否出现跳变。
+8. 检查 pose 四元数是否归一化和 finite。
+
+验收：
+
+- 左右手柄区分正确。
+- 左右 pose frame_id 一致。
+- Grip 按下和释放状态正确。
+- 原始输入频率满足 bridge 的 freshness 要求。
+- 断连时有明确超时，不保留旧 pose 继续控制。
+
+### 阶段 G：坐标变换和 clutch 验证
+
+目标：在接入 IK 前把方向问题完全定位在 bridge 层。
+
+任务：
+
+1. 启动 XR adapter。
+2. 启动 pose clutch bridge。
+3. 不启动 IK，直接观察 target PoseStamped。
+4. 用左 Grip 建立左侧 anchor。
+5. 只移动左手柄 X。
+6. 只移动左手柄 Y。
+7. 只移动左手柄 Z。
+8. 分别绕三个轴旋转。
+9. 对右侧重复。
+10. 松开 Grip，确认 target 停止。
+11. 重新按 Grip，确认新 anchor 生效且没有跳跃。
+
+当前必须重点验证的修正：
+
+- X 平移取反。
+- 左手 Y 平移取反。
+- 右手 Y 平移不取反。
+- 三个旋转轴的方向和速度。
+
+### 阶段 H：Quest 到 MuJoCo 双臂闭环
+
+目标：完成第一版真实手柄遥操仿真。
+
+节点链：
+
+~~~text
+qiling_xrobotoolkit_pxrea_adapter
+        |
+        +--> /xr/* pose
+        +--> /xr/controller_joy
+                    |
+                    v
+qiling_xr_pose_clutch_bridge
+        |
+        +--> /teleop/*_wrist_target
+        +--> /teleop/*_control_mode
+                    |
+                    v
+qiling_differential_ik
+        |
+        v
+/human_lower_command
+                    |
+                    v
+qiling_mujoco_simulator
+~~~
+
+任务：
+
+1. 先只激活左臂。
+2. 验证左 Grip clutch。
+3. 验证左手位置和姿态。
+4. 再只激活右臂。
+5. 验证右 Grip clutch。
+6. 最后同时激活双臂。
+7. 在 home 附近做小范围运动。
+8. 逐步扩大 workspace。
+9. 检查输入超时。
+10. 检查手柄追踪跳变。
+11. 检查暂停/恢复。
+
+验收：
+
+- 不按 Grip 时手臂不缓慢漂移。
+- 按下 Grip 的瞬间不跳变。
+- 释放 Grip 后目标保持。
+- 双臂方向符合定义。
+- 平移和旋转都可以控制。
+- 末端不会持续出现无来源运动。
+- 关节命令不会大范围跳变。
+
+### 阶段 I：O6 仿真接入
+
+目标：先在 MuJoCo 中完成双臂和 O6 的统一命令链。
+
+任务：
+
+1. 读取 qiling_grasp_ws 中 O6 控制模式。
+2. 确认真实 O6 ROS 2 命令消息。
+3. 确认 MuJoCo O6 joint name。
+4. 建立左右 O6 的显式 joint map。
+5. 设计 O6 输入到手指关节的映射。
+6. 第一版使用开合或抓取模式。
+7. 再实现连续手指角度控制。
+8. 让 O6 命令进入统一 command mux。
+9. 检查双臂 IK 和 O6 不相互覆盖。
+10. 检查 40 维命令每一槽的来源。
+
+第一版可以采用：
+
+~~~text
+左 trigger  -> 左 O6 抓取开合
+右 trigger  -> 右 O6 抓取开合
+或：
+左/右指定按键 -> 预设 O6 grasp mode
+~~~
+
+高质量数据采集阶段应优先使用连续手指状态，而不是只有几个离散模式。
+
+### 阶段 J：真实机器人接入
+
+目标：把经过仿真验证的双臂和 O6 控制接入真实机器人。
+
+任务：
+
+1. 确认真实机器人 ROS 2 Humble 环境。
+2. 确认真实 /joint_states 或等效状态话题。
+3. 确认真实双臂控制话题。
+4. 确认 MITJointCommands 的 40 维排列。
+5. 确认 arm SDK 50 Hz 上限。
+6. 确认 O6 命令的频率和失联保护。
+7. 确认真实 robot_base / base_link 的 TF。
+8. 确认真实末端 frame 和 URDF frame 一致。
+9. 在无负载、低 kp、小范围下测试。
+10. 先单臂，再双臂，再接 O6。
+11. 加入硬件急停和软件 deadman。
+12. 设定 workspace、关节、速度和加速度限制。
+
+真实机器人第一轮不得直接使用仿真中的全部速度和增益。必须从低速、低增益、短行程开始。
+
+---
+
+## 12. 数据录制与 LeRobot 转换
+
+### 12.1 录制原则
+
+录制器只保留后续训练需要的数据，不记录所有调试数据到最终数据集。
+
+推荐把数据分成两层：
+
+调试层，可选：
+
+- 原始 XR pose。
+- bridge 生成的 target pose。
+- current wrist pose。
+- position/rotation error。
+- qdot。
+- QP status。
+- 节点时间戳。
+- 丢帧、超时和安全状态。
+
+训练层，必须：
+
+- 相机观测。
+- 机器人当前关节位置。
+- 机器人当前关节速度，若训练任务需要。
+- O6 当前关节或手部状态。
+- action，即希望机器人执行的关节/末端动作表示。
+- 时间戳。
+- episode、frame、task 等元数据。
+
+不建议放入训练层：
+
+- 实际发送的 MIT kp。
+- 实际发送的 MIT kd。
+- MIT velocity 全部细节。
+- MIT effort 全部细节。
+- QP 内部矩阵。
+- 所有 ROS 诊断日志。
+
+### 12.2 Action 表示
+
+首选 action 表示为语义化的机器人目标：
+
+方案 1：双臂关节目标 + O6 目标
+
+~~~text
+left_arm_q_target  7
+right_arm_q_target 7
+left_o6_target     N
+right_o6_target    N
+~~~
+
+优点：
+
+- 与真实执行器接口接近。
+- 容易复现。
+- 不把底层 MIT 参数混入行为数据。
+- 离线转换简单。
+
+方案 2：双腕末端位姿 + O6 目标
+
+~~~text
+left_wrist_pose    7
+right_wrist_pose   7
+left_o6_target     N
+right_o6_target    N
+~~~
+
+优点：
+
+- 更接近 Quest 遥操意图。
+- 适合学习末端目标。
+
+缺点：
+
+- 训练时还需要在线 IK。
+- 数据重放时要确保 IK 版本和关节限制一致。
+
+第一阶段建议同时保存中间语义字段，但在导出 LeRobot 时明确选定一种 action 定义，不能一会儿使用 q_target、一会儿使用实际 q。
+
+### 12.3 观测字段
+
+当前只有头部 D435 相机，因此第一阶段建议：
+
+~~~text
+observation.images.head
+observation.state
+action
+timestamp
+episode_index
+frame_index
+task
+~~~
+
+如果使用关节状态作为 observation：
+
+~~~text
+observation.state =
+  left_arm_position[7]
+  right_arm_position[7]
+  left_o6_position[N]
+  right_o6_position[N]
+~~~
+
+若后续真实机器人有两个腕部 D405，再增加：
+
+~~~text
+observation.images.left_wrist
+observation.images.right_wrist
+~~~
+
+但是录制器和相机发布器必须同时检查时间戳、帧率、图像编码和相机内参。
+
+### 12.4 录制时钟和同步
+
+录制器应使用单一时间基准：
+
+- ROS 2 message header stamp 作为消息时间。
+- 录制器到达时间只作为接收延迟诊断。
+- 以相机帧为主或以机器人状态为主，必须提前固定。
+- 每一帧记录最近的机器人状态和 action。
+- 如果超过同步窗口，标记无效或丢弃，不静默混配。
+
+第一版建议：
+
+~~~text
+相机帧到达 -> 查找最近机器人 state/action -> 写入一帧
+~~~
+
+后续可以改成固定 30 Hz 或 50 Hz 的统一采样时钟。
+
+### 12.5 独立转换脚本
+
+录制流程：
+
+~~~text
+ROS 2 topics
+    |
+    v
+raw episode directory
+    |
+    v
+validate script
+    |
+    v
+convert_to_lerobot.py
+    |
+    v
+LeRobot dataset
+~~~
+
+转换脚本必须完成：
+
+1. 检查每个字段长度。
+2. 检查字段是否 finite。
+3. 检查图像数量和状态帧数量。
+4. 检查时间戳单调递增。
+5. 检查 action / observation 的维度。
+6. 检查 episode 是否有明确终止原因。
+7. 检查任务名称和语言描述。
+8. 输出转换统计。
+9. 对缺失帧、丢帧和异常关节值报错或明确标记。
+
+转换前应保存数据字典，说明：
+
+- 每一维的 joint name。
+- 单位。
+- 参考坐标系。
+- action 语义。
+- O6 关节排列。
+- 图像 topic 和相机内参。
+
+---
+
+## 13. 头部 D435 和后续腕部 D405
+
+### 13.1 当前头部相机
+
+MuJoCo 中的相机名：
+
+~~~text
+d435_camera
+~~~
+
+相机位姿已按以下 URDF 作为参考：
+
+~~~text
+src/qi_robot_description/urdf/s4_40DOF_fullbody_with_handeye_camera.urdf
+~~~
+
+当前 MuJoCo 相机近似配置：
+
+~~~text
+pos  = 0.0240925853, 0.0044939526, 0.6924775167
+fovy = 58
+size = 640 x 480
+~~~
+
+相机发布器的静态 TF 也必须和 MuJoCo 相机外参一致。不能只修改 XML 而不修改 camera_info 或静态 TF。
+
+### 13.2 躯干可视化
+
+为了避免头部相机被躯干模型遮挡，MuJoCo 当前已将躯干主要视觉网格设为透明或不可见，同时保留必要的碰撞/结构配置。后续如果需要更准确地保留碰撞：
+
+- 可以只隐藏视觉 geom。
+- 保留碰撞 geom。
+- 不应为了画面清晰而删除影响机械臂碰撞的真实几何。
+
+### 13.3 Quest 视频问题
+
+当前 D435 publisher 只发布 ROS 2 图像。它不能自动完成：
+
+- 把图像编码后发送到 Quest 3。
+- 在 Quest 中显示平面画面。
+- 实现低延迟视频回传。
+
+如果将来需要 Quest 画面，单独增加视频链路：
+
+~~~text
+ROS 2 image
+    |
+    v
+硬件/软件编码 H.264 或 H.265
+    |
+    v
+局域网低延迟传输
+    |
+    v
+Quest 客户端平面纹理显示
+~~~
+
+由于当前已经决定先不考虑视频画面传入，第一阶段不要把视频显示耦合到控制闭环中。控制链路即使没有 Quest 画面也必须可以独立运行和录制。
+
+---
+
+## 14. 性能、实时性和线程设计
+
+### 14.1 频率分层
+
+推荐频率：
+
+~~~text
+MuJoCo 内部积分             1 kHz
+XRoboToolkit pose 发布       90 Hz
+clutch/目标位姿更新          50 Hz
+Pinocchio + ProxQP IK        50 Hz
+真实手臂 ROS 2 命令          <= 50 Hz
+相机发布                     30 Hz
+数据集导出                   离线
+~~~
+
+### 14.2 C++ 实时路径
+
+50 Hz 控制循环每周期预算为 20 ms。控制循环中应避免：
+
+- 频繁动态分配大对象。
+- 文件 IO。
+- 大量 printf。
+- 等待图像。
+- 等待 XR 网络回调。
+- 等待 service。
+- 调用 Python。
+- 运行 IPOPT 等非线性优化器。
+
+推荐：
+
+- 节点启动时预分配 Eigen / ProxQP 工作区。
+- 回调只更新最新状态，并使用互斥锁或无锁快照。
+- 控制线程固定周期运行。
+- 把详细日志降频到 1 Hz 或按需开启。
+- 发布控制命令前统一做 finite 和范围检查。
+- 记录 solve time 的最大值、均值和 P99。
+
+### 14.3 是否需要 C++
+
+当前直接使用 C++ 是合理的，原因：
+
+- 机器人控制上限为 50 Hz，但需要稳定低延迟。
+- Pinocchio 和 ProxQP 都有成熟 C++ 接口。
+- 可以减少 Python GC、对象分配和跨语言数据拷贝。
+- 后续真实机器人接入不需要再替换 IK 主路径。
+
+PyRoki、Python 差分 IK 或 CasADi + IPOPT 可以作为离线验证工具，但不应进入当前实时控制主链。
+
+### 14.4 运行时监控
+
+每个周期至少监控：
+
+- loop period。
+- solve time。
+- qdot max。
+- q_target 与 q 的差异。
+- position error。
+- rotation error。
+- target age。
+- joint state age。
+- QP status。
+- command publish count。
+
+日志示例应降频输出，不应每帧打印：
+
+~~~text
+Cartesian error:
+left position=...
+left rotation=...
+right position=...
+right rotation=...
+solve_ms=...
+target_age_ms=...
+~~~
+
+---
+
+## 15. 安全机制
+
+### 15.1 软件安全边界
+
+必须具备：
+
+- 关节位置上下限。
+- 关节限位 margin。
+- 最大关节速度。
+- 最大末端平移误差。
+- 最大末端旋转误差。
+- 目标变化速率限制。
+- qdot 低通或加速度限制。
+- XR 输入超时 hold。
+- JointState 超时 hold。
+- QP 失败 hold。
+- 命令 finite 检查。
+- command mux 唯一发布者。
+
+### 15.2 clutch 安全
+
+Grip 松开时：
+
+- 不把手柄当前位置继续作为目标。
+- 不使用旧 qdot。
+- 目标重置到当前机器人末端状态。
+- 模式变为 hold。
+
+Grip 再按下时：
+
+- 重新建立 anchor。
+- 第一个 active 目标等于当前 robot anchor。
+- 禁止跨越按下瞬间产生大位移。
+
+### 15.3 真实机器人安全顺序
+
+~~~text
+无动力 / 仿真
+    |
+    v
+单臂、低速度、低 kp
+    |
+    v
+单臂完整位姿
+    |
+    v
+双臂低速
+    |
+    v
+加入 O6
+    |
+    v
+小范围数据录制
+    |
+    v
+正常速度和任务
+~~~
+
+任何出现以下情况都应立刻释放 Grip 或急停：
+
+- 末端快速跳变。
+- 关节持续向限位运动。
+- q_target 与实际 q 长时间分离。
+- 手柄失联但机器人仍运动。
+- O6 手指持续闭合。
+- 双臂或手指碰撞。
+
+---
+
+## 16. 调试和验收方法
+
+### 16.1 ROS 2 图检查
+
+启动系统后检查：
+
+~~~bash
+ros2 node list
+ros2 topic list
+ros2 topic info -v /human_lower_command
+ros2 topic info -v /joint_states
+ros2 topic hz /joint_states
+ros2 topic hz /xr/left_controller_pose
+ros2 topic hz /xr/right_controller_pose
+~~~
+
+重点确认：
+
+- /human_lower_command 只有一个有效 publisher。
+- /joint_states 有且只有预期的状态源。
+- /teleop target 没有重复 publisher。
+- XR pose 频率稳定。
+- 无其他旧版 teleop 节点在后台运行。
+
+### 16.2 手柄输入检查
+
+~~~bash
+ros2 topic echo /xr/controller_joy
+ros2 topic echo /xr/left_controller_pose
+ros2 topic echo /xr/right_controller_pose
+~~~
+
+检查：
+
+- 左右 Grip 是否分别变化。
+- axes[2] 和 axes[3] 是否是模拟握把值。
+- buttons[4] 和 buttons[5] 是否是数字握把值。
+- pose 的位置和四元数是否 finite。
+- 左右手柄没有交换。
+
+### 16.3 目标位姿检查
+
+~~~bash
+ros2 topic echo /teleop/left_wrist_target
+ros2 topic echo /teleop/right_wrist_target
+~~~
+
+在松开 Grip 时，目标不应持续变化。按住 Grip 后，只进行一个轴的动作时，应只观察到对应方向的变化。
+
+### 16.4 IK 检查
+
+观察：
+
+- differential IK 是否加载 s4_dual_arm.urdf。
+- 左右 frame 是否正确。
+- Cartesian error 是否在目标不动时收敛到接近零。
+- qdot 是否在合理范围内。
+- QP 是否出现失败。
+- 目标超时后 q_target 是否停止积分。
+
+### 16.5 典型问题定位
+
+问题：不按 Grip 手臂仍缓慢移动。
+
+排查：
+
+1. bridge 是否发布了 mode=1。
+2. bridge 是否继续发布变化的 target。
+3. IK 是否在 hold 时仍积分 qdot。
+4. q_target 是否每帧被错误覆盖。
+5. 是否有第二个 publisher。
+6. MuJoCo 是否仍在执行上一帧 MIT 命令。
+
+问题：只旋转时位置明显移动。
+
+排查：
+
+1. target PoseStamped 的 position 是否真的不变。
+2. robot wrist frame 是否位于预期位置。
+3. Pinocchio Jacobian reference 是否正确。
+4. rotation error 是否被错误写到线速度部分。
+5. QP 是否存在奇异位形。
+6. 是否需要 posture/null-space 或任务优先级。
+
+问题：绕 base_link X 轴方向反。
+
+排查：
+
+1. XR 原始旋转方向。
+2. M 基础轴变换。
+3. anchor_basis_change。
+4. rotation_sign_x。
+5. PoseStamped 的 quaternion 组合顺序。
+6. MuJoCo 和 URDF frame 的轴定义。
+
+问题：加载后左臂不在 home 或无法控制。
+
+排查：
+
+1. 是否真的调用了 /unpause_mujoco。
+2. homeTransition 是否完成。
+3. qpos keyframe 长度是否为 47。
+4. left arm 的 XML 关节顺序是否正确。
+5. differential IK 是否收到对应的 JointState name。
+6. q_target 是否在第一帧状态时初始化。
+
+---
+
+## 17. 推荐的后续实现顺序
+
+当前建议严格按照以下顺序继续：
+
+### 下一步 1：冻结当前双臂位姿闭环
+
+- 不改变当前 Quest 映射。
+- 不再增加平移/旋转模式。
+- 增加/保留日志和诊断。
+- 完成坐标和双臂闭环验收。
+
+### 下一步 2：完善 IK 数值质量
+
+- 增加 qdot 平滑。
+- 增加 posture/null-space 目标。
+- 评估任务误差和非期望方向运动。
+- 检查奇异位形。
+- 确定真实机器人安全参数。
+
+### 下一步 3：接入 O6
+
+- 先检查 qiling_grasp_ws。
+- 记录 O6 topic、message、joint map。
+- 先实现仿真中的 trigger 或 grasp mode。
+- 再将 O6 加入唯一 command mux。
+
+### 下一步 4：完善数据录制
+
+- 定义 observation.state。
+- 定义 action。
+- 建立 raw episode 格式。
+- 录制头部 D435。
+- 写 validate 脚本。
+- 写 LeRobot 转换脚本。
+
+### 下一步 5：真实机器人单臂测试
+
+- 仅左臂。
+- 低速度、低增益。
+- 无 O6 或只使用安全开合模式。
+- 验证 clutch、超时和急停。
+
+### 下一步 6：真实双臂和 O6
+
+- 右臂。
+- 双臂。
+- O6。
+- 小范围任务。
+- 最终数据质量验收。
+
+---
+
+## 18. 当前完成项和未完成项
+
+### 已完成或已有实现
+
+- MuJoCo 场景路径已切换到 qi_robot_description/new_scene/scene_S4_40DOF_fullbody.xml。
+- MuJoCo 支持固定 base。
+- MuJoCo 支持冻结腿部。
+- 保留完整 40 维 /human_lower_command 接口。
+- 解锁后支持多阶段 home 过渡。
+- 当前 home 关节值已更新为用户最后指定的双臂值。
+- 头部 D435 的 MuJoCo 位姿已经参考带 hand-eye camera 的 URDF。
+- 躯干主要视觉遮挡已处理。
+- C++ Pinocchio 模型已使用 s4_dual_arm.urdf。
+- C++ ProxQP 差分 IK 已建立。
+- q_target 不再每帧被当前 q 错误覆盖。
+- XRoboToolkit / PXREA SDK 适配器已建立。
+- Quest 3 左右手柄已能连接并控制双臂。
+- Grip clutch 已建立。
+- 平移方向已按实测进行 X、左手 Y 的修正。
+- 当前控制方式已经统一为完整 6D 位姿控制。
+
+### 仍需完成
+
+- 对当前统一 6D IK 做系统化误差、耦合和奇异位形验证。
+- 进一步改善只旋转时的非期望位置变化。
+- 加入 posture/null-space 或更合适的带软约束 QP 目标。
+- 检查并确保没有后台旧节点造成重复发布。
+- 明确 O6 的真实消息、关节数和映射。
+- 实现 O6 仿真控制。
+- 建立 40 维命令的唯一 mux。
+- 完成真实机器人 50 Hz 控制链路。
+- 完成头部 D435 的数据录制。
+- 决定是否在后续加入两个腕部 D405。
+- 完成 raw episode 到 LeRobot 的独立转换脚本。
+- 在真实机器人上完成低速安全测试。
+
+---
+
+## 19. 设计原则
+
+1. 先验证数据流，再调 IK；先验证坐标系，再调增益。
+2. MuJoCo 和真实机器人共享同一套双臂关节名称、末端 frame 和 action 语义。
+3. 仿真模型、Pinocchio URDF、真实机器人 URDF 的职责不能混用。
+4. 所有左右臂关节都通过 joint name 显式映射。
+5. 所有坐标变换都必须可记录、可复现、可单元测试。
+6. 所有目标位姿都必须有时间戳、freshness 和跳变限制。
+7. 所有控制命令都必须有唯一发布者。
+8. 50 Hz 是真实手臂命令接口的硬约束。
+9. MuJoCo 的 1 kHz 只代表仿真内部积分频率，不代表可以向真实 SDK 发送 1 kHz 命令。
+10. O6 接入之前，必须先解决消息维度和关节映射，不能凭数组下标猜测。
+11. episode 记录的是训练语义，不是底层控制器的全部内部变量。
+12. 任何出现持续漂移、跳变、超限或失联运动的情况，都优先进入 hold/急停状态。
 
