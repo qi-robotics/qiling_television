@@ -45,36 +45,18 @@ SimulateBridge::SimulateBridge(mjData* d, mjModel* m, mujoco::Simulate& sim) : N
     modelTableFlag_ = config["modelTableFlag"].as<bool>();
     fixedBase_ = config["fixedBase"] ? config["fixedBase"].as<bool>() : false;
     freezeLegs_ = config["freezeLegs"] ? config["freezeLegs"].as<bool>() : false;
-    homeTransitionEnabled_ = config["homeTransitionEnabled"] ?
-        config["homeTransitionEnabled"].as<bool>() : true;
-    startupKeyframeName_ = config["startupKeyframe"] ?
-        config["startupKeyframe"].as<std::string>() : "teleop_start";
-    targetKeyframeName_ = config["targetKeyframe"] ?
-        config["targetKeyframe"].as<std::string>() : "teleop_home";
-    if (config["homeTransitionKeyframes"]) {
-        homeTransitionKeyframeNames_ =
-            config["homeTransitionKeyframes"].as<std::vector<std::string>>();
-    }
-    if (config["homeTransitionDurations"]) {
-        homeTransitionDurations_ =
-            config["homeTransitionDurations"].as<std::vector<double>>();
-    }
-    homeTransitionKp_ = config["homeTransitionKp"] ?
-        config["homeTransitionKp"].as<double>() : 70.0;
-    homeTransitionKd_ = config["homeTransitionKd"] ?
-        config["homeTransitionKd"].as<double>() : 6.0;
-    homeHoldKp_ = config["homeHoldKp"] ? config["homeHoldKp"].as<double>() : 80.0;
-    homeHoldKd_ = config["homeHoldKd"] ? config["homeHoldKd"].as<double>() : 8.0;
-    if (homeTransitionKeyframeNames_.empty()) {
-        homeTransitionKeyframeNames_ = {
-            startupKeyframeName_, "teleop_elbow_lift", "teleop_shoulder_rear", targetKeyframeName_};
-    }
+    idleHoldKp_ = config["idleHoldKp"] ? config["idleHoldKp"].as<double>() : 40.0;
+    idleHoldKd_ = config["idleHoldKd"] ? config["idleHoldKd"].as<double>() : 2.0;
+    maxControlRateNmPerSec_ = config["maxControlRateNmPerSec"] ?
+        config["maxControlRateNmPerSec"].as<double>() : 1000.0;
     
     // 如有设置,则暂停仿真
     if(initPauseFlag_) mj_sim_.run = 0;
 
-    // 读取模型内容参数
+    // 读取模型内容参数。home 不在 MuJoCo 内部执行，由 qiling_kinematics
+    // 作为唯一的外部命令发布者执行。
     ReadModel();
+    InitializeZeroActuatedState();
     // 输出相关的ID
     ShowModel();
 
@@ -126,6 +108,7 @@ SimulateBridge::SimulateBridge(mjData* d, mjModel* m, mujoco::Simulate& sim) : N
     lowState_.joint_states.velocity.assign(mj_model_->nu, 0);
     lowState_.joint_states.effort.assign(mj_model_->nu, 0);
     jointCommands_.commands.resize(mj_model_->nu);
+    previousControl_.assign(mj_model_->nu, 0.0);
     for(size_t i = 0; i < m->nu; i++){
         jointCommands_.commands[i].pos = 0;
         jointCommands_.commands[i].vel = 0;
@@ -145,11 +128,14 @@ SimulateBridge::SimulateBridge(mjData* d, mjModel* m, mujoco::Simulate& sim) : N
     }
 
     ApplyKinematicLocks();
-    // Start the safe transition here as well as from the ROS unpause service.
-    // The MuJoCo GUI play button changes mj_sim_.run directly and does not
-    // invoke that service; without this call the model remains at
-    // teleop_start and never reaches teleop_home.
-    StartHomeTransition();
+    idleHoldPosition_.assign(mj_model_->nu, 0.0);
+    for (int actuatorIndex = 0; actuatorIndex < mj_model_->nu; ++actuatorIndex) {
+        const int jointId = mj_model_->actuator_trnid[2 * actuatorIndex];
+        if (jointId >= 0 && jointId < mj_model_->njnt) {
+            const int qposAdr = mj_model_->jnt_qposadr[jointId];
+            idleHoldPosition_[actuatorIndex] = mj_data_->qpos[qposAdr];
+        }
+    }
     RCLCPP_INFO(
         this->get_logger(),
         "第一阶段遥操仿真锁定: fixedBase=%s, frozenLegJoints=%zu, nu=%d",
@@ -165,6 +151,21 @@ SimulateBridge::SimulateBridge(mjData* d, mjModel* m, mujoco::Simulate& sim) : N
             "freezeLegs=true，但只找到 %zu 个腿部关节，期望 12 个",
             lockedLegJoints_.size());
     }
+}
+
+double SimulateBridge::LimitControlRate(size_t actuatorIndex, double desired, double dt)
+{
+    if (actuatorIndex >= previousControl_.size() ||
+        !std::isfinite(desired) || !std::isfinite(dt) || dt <= 0.0 ||
+        !std::isfinite(maxControlRateNmPerSec_) || maxControlRateNmPerSec_ <= 0.0) {
+        return desired;
+    }
+    const double maxDelta = maxControlRateNmPerSec_ * dt;
+    const double limited = std::clamp(
+        desired, previousControl_[actuatorIndex] - maxDelta,
+        previousControl_[actuatorIndex] + maxDelta);
+    previousControl_[actuatorIndex] = limited;
+    return limited;
 }
 
 /**
@@ -206,20 +207,27 @@ void SimulateBridge::UnPauseServiceCallBack(
     // 如果初始暂停了物理仿真,则继续
     if(initPauseFlag_ && mj_sim_.run == 0) mj_sim_.run = 1;
 
-    // 应用遥操起始关键帧，并从安全姿态开始平滑过渡到目标 home。
-    const int startupKeyId = mj_name2id(
-        mj_model_, mjOBJ_KEY, startupKeyframeName_.c_str());
-    if (startupKeyId >= 0) {
-        mj_resetDataKeyframe(mj_model_, mj_data_, startupKeyId);
-    } else if (modelParam_.keyFrameCount > 0) {
-        RCLCPP_WARN(
-            this->get_logger(), "未找到起始 keyframe '%s'，退回 keyframe 0",
-            startupKeyframeName_.c_str());
-        mj_resetDataKeyframe(mj_model_, mj_data_, 0);
-    }
-
+    // 解除暂停只恢复物理运行，不重置 keyframe，也不启动内部 home。
     ApplyKinematicLocks();
-    StartHomeTransition();
+}
+
+void SimulateBridge::InitializeZeroActuatedState()
+{
+    // 保留 free base 的初始位置和单位四元数，仅将所有可驱动关节
+    // （腿、双臂及 O6）置为零位，保证仿真启动时不会跳到 XML keyframe。
+    for (int jointId = 0; jointId < mj_model_->njnt; ++jointId) {
+        if (mj_model_->jnt_type[jointId] == mjJNT_FREE) {
+            continue;
+        }
+        const int qposAdr = mj_model_->jnt_qposadr[jointId];
+        const int dofAdr = mj_model_->jnt_dofadr[jointId];
+        mj_data_->qpos[qposAdr] = 0.0;
+        mj_data_->qvel[dofAdr] = 0.0;
+    }
+    for (auto & lockedJoint : lockedLegJoints_) {
+        lockedJoint.qpos = 0.0;
+    }
+    mj_forward(mj_model_, mj_data_);
 }
 
 void SimulateBridge::ApplyKinematicLocks()
@@ -247,76 +255,12 @@ bool SimulateBridge::IsFrozenLegActuator(size_t actuatorIndex) const
            frozenLegActuators_[actuatorIndex];
 }
 
-void SimulateBridge::StartHomeTransition()
+bool SimulateBridge::GetIdleHoldTarget(size_t actuatorIndex, double & position) const
 {
-    homeTransitionSegment_ = 0;
-    homeTransitionSegmentStartTime_ = mj_data_->time;
-    homeTransitionActive_ = homeTransitionEnabled_ &&
-        homeTransitionWaypoints_.size() >= 2 &&
-        homeTransitionDurations_.size() + 1 == homeTransitionWaypoints_.size();
-
-    homeTransitionPosition_.assign(mj_model_->nu, 0.0);
-    homeTransitionVelocity_.assign(mj_model_->nu, 0.0);
-    for (int actuatorIndex = 0; actuatorIndex < mj_model_->nu; ++actuatorIndex) {
-        const int jointId = mj_model_->actuator_trnid[2 * actuatorIndex];
-        const int qposAdr = mj_model_->jnt_qposadr[jointId];
-        homeTransitionPosition_[actuatorIndex] = mj_data_->qpos[qposAdr];
-    }
-}
-
-void SimulateBridge::UpdateHomeTransition(double simTime)
-{
-    if (!homeTransitionActive_) {
-        return;
-    }
-
-    while (homeTransitionSegment_ < homeTransitionDurations_.size()) {
-        const double duration = homeTransitionDurations_[homeTransitionSegment_];
-        if (duration <= 0.0 || simTime < homeTransitionSegmentStartTime_ + duration) {
-            break;
-        }
-        homeTransitionSegmentStartTime_ += duration;
-        ++homeTransitionSegment_;
-    }
-
-    if (homeTransitionSegment_ >= homeTransitionDurations_.size()) {
-        homeTransitionActive_ = false;
-        homeTransitionPosition_ = homeTransitionWaypoints_.back();
-        std::fill(homeTransitionVelocity_.begin(), homeTransitionVelocity_.end(), 0.0);
-        return;
-    }
-
-    const double duration = homeTransitionDurations_[homeTransitionSegment_];
-    const double u = std::clamp(
-        (simTime - homeTransitionSegmentStartTime_) / duration, 0.0, 1.0);
-    const double s = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
-    const double dsdu = 30.0 * u * u - 60.0 * u * u * u + 30.0 * u * u * u * u;
-    const auto & start = homeTransitionWaypoints_[homeTransitionSegment_];
-    const auto & end = homeTransitionWaypoints_[homeTransitionSegment_ + 1];
-    for (std::size_t i = 0; i < homeTransitionPosition_.size(); ++i) {
-        const double delta = end[i] - start[i];
-        homeTransitionPosition_[i] = start[i] + s * delta;
-        homeTransitionVelocity_[i] = dsdu * delta / duration;
-    }
-}
-
-bool SimulateBridge::GetHomeTransitionTarget(
-    size_t actuatorIndex, double & position, double & velocity) const
-{
-    if (!homeTransitionActive_ || actuatorIndex >= homeTransitionPosition_.size()) {
+    if (actuatorIndex >= idleHoldPosition_.size()) {
         return false;
     }
-    position = homeTransitionPosition_[actuatorIndex];
-    velocity = homeTransitionVelocity_[actuatorIndex];
-    return true;
-}
-
-bool SimulateBridge::GetHomeHoldTarget(size_t actuatorIndex, double & position) const
-{
-    if (actuatorIndex >= homeTargetPosition_.size()) {
-        return false;
-    }
-    position = homeTargetPosition_[actuatorIndex];
+    position = idleHoldPosition_[actuatorIndex];
     return true;
 }
 
@@ -535,53 +479,9 @@ void SimulateBridge::ReadModel(){
     modelParam_.modelName = mj_model_->names;
     // 读取加载的模型时间步长
     modelParam_.timeStep = mj_model_->opt.timestep;
-    // 加载关键帧个数
+    // 仅记录模型中的 keyframe 数量用于模型信息显示；仿真启动和解除暂停
+    // 均不再读取或重置 keyframe。
     modelParam_.keyFrameCount = mj_model_->nkey;
-    const int startupKeyId = mj_name2id(
-        mj_model_, mjOBJ_KEY, startupKeyframeName_.c_str());
-    if (startupKeyId >= 0) {
-        mj_resetDataKeyframe(mj_model_, mj_data_, startupKeyId);
-    } else if (modelParam_.keyFrameCount > 0) {
-        RCLCPP_WARN(
-            this->get_logger(), "未找到起始 keyframe '%s'，退回 keyframe 0",
-            startupKeyframeName_.c_str());
-        mj_resetDataKeyframe(mj_model_, mj_data_, 0);
-    }
-
-    if (homeTransitionKeyframeNames_.empty()) {
-        homeTransitionKeyframeNames_ = {
-            startupKeyframeName_, "teleop_elbow_lift", "teleop_shoulder_rear", targetKeyframeName_};
-    }
-    homeTransitionWaypoints_.clear();
-    for (const auto & keyframeName : homeTransitionKeyframeNames_) {
-        const int keyId = mj_name2id(mj_model_, mjOBJ_KEY, keyframeName.c_str());
-        if (keyId < 0) {
-            RCLCPP_ERROR(
-                this->get_logger(), "未找到 home 过渡 keyframe '%s'，禁用 home 过渡",
-                keyframeName.c_str());
-            homeTransitionWaypoints_.clear();
-            break;
-        }
-        std::vector<double> waypoint(mj_model_->nu, 0.0);
-        for (int actuatorIndex = 0; actuatorIndex < mj_model_->nu; ++actuatorIndex) {
-            const int jointId = mj_model_->actuator_trnid[2 * actuatorIndex];
-            const int qposAdr = mj_model_->jnt_qposadr[jointId];
-            waypoint[actuatorIndex] =
-                mj_model_->key_qpos[keyId * mj_model_->nq + qposAdr];
-        }
-        homeTransitionWaypoints_.push_back(std::move(waypoint));
-    }
-    if (!homeTransitionWaypoints_.empty()) {
-        homeTargetPosition_ = homeTransitionWaypoints_.back();
-    }
-    if (homeTransitionWaypoints_.size() >= 2 &&
-        homeTransitionDurations_.size() + 1 != homeTransitionWaypoints_.size()) {
-        RCLCPP_WARN(
-            this->get_logger(), "homeTransitionDurations 数量不匹配，使用均分 3 秒过渡");
-        homeTransitionDurations_.assign(
-            homeTransitionWaypoints_.size() - 1,
-            3.0 / static_cast<double>(homeTransitionWaypoints_.size() - 1));
-    }
 
     // 保存浮动基座和腿部的 home 状态。它们在第一阶段只作为可视模型，
     // 不应因重力或双臂反作用力改变。

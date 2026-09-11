@@ -23,9 +23,11 @@ struct IkDiagnostics
   int position_rank{0};
   double position_sigma_min{0.0};
   double position_condition_number{0.0};
+  double position_speed_scale{1.0};
   int wrist_rank{0};
   double wrist_sigma_min{0.0};
   double wrist_condition_number{0.0};
+  double orientation_speed_scale{1.0};
   bool elbow_geometry_valid{false};
   bool elbow_used_previous_direction{false};
   bool elbow_used_home_direction{false};

@@ -67,6 +67,49 @@ URDF `q_min/q_max` 现在是唯一硬位置边界；`joint_limit_margin_rad` 是
 
 ## ROS 接口
 
+## 启动时 Home 流程
+
+`xr_teleop_real.launch.py` 当前在仿真闭环中也承担启动 Home。启动后，差分 IK 节点
+会等待左右臂各收到一份完整且新鲜的 7 关节状态，然后由同一个 `/human_lower_command`
+发布者依次执行：
+
+```text
+当前测量姿态（仿真为全零）
+    -> 安全过渡点
+    -> home
+    -> 每侧 Grip 释放一次后允许该侧遥操
+```
+
+Home 关节目标为左臂 `[0, 10, 0, -90, 0, 0, 0]`、右臂 `[0, -10, 0, -90, 0, 0, 0]`
+（单位：度）。当前仿真验证用过渡点为：
+
+```text
+left : [1.00,  1.20, 0.00, -1.20, 0, 0, 0]
+right: [1.00, -1.20, 0.00, -1.20, 0, 0, 0]
+```
+
+过渡点和 home 使用五次多项式轨迹，并在目标附近等待稳定。Home 阶段会忽略 Quest
+目标和 Grip；O6 对应命令的位置、速度和前馈保持零，并使用小的保持增益固定在零位。
+任何一侧状态超时或目标未达到稳定误差，流程会
+进入故障保持，不会自动开放遥操。
+
+MuJoCo 只负责执行外部 MIT 命令：它启动时将所有非浮动可驱动关节置零，并在收到
+运动学节点的首个命令前保持零位；解除暂停不会再读取或重置旧 keyframe。
+
+推荐仿真启动顺序：
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch mujoco_simulator simulate.launch.py
+ros2 service call /unpause_mujoco std_srvs/srv/Empty "{}"
+ros2 launch qiling_kinematics xr_teleop_real.launch.py
+```
+
+观察 `qiling_differential_ik` 日志中的 `startup home phase=`，应依次看到
+`MOVE_TO_TRANSITION`、`SETTLE_AT_TRANSITION`、`MOVE_TO_HOME`、`SETTLE_AT_HOME`、
+`COMPLETE`。仿真启动时的旧 MuJoCo keyframe home 流程已经关闭。
+
 输入：
 
 - `/joint_states`：使用左右臂 14 个关节名和位置。

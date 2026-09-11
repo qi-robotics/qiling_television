@@ -1,4 +1,5 @@
 #include <array>
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -30,14 +31,14 @@ std::filesystem::path descriptionPath(const std::filesystem::path & relative)
 ArmVector leftHome()
 {
   ArmVector q;
-  q << -0.45, 0.30, 0.02, -1.40, 1.40, 0.0, 0.0;
+  q << 0.0, 0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0;
   return q;
 }
 
 ArmVector rightHome()
 {
   ArmVector q;
-  q << -0.45, -0.30, 0.02, -1.40, 1.40, 0.0, 0.0;
+  q << 0.0, -0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0;
   return q;
 }
 
@@ -111,8 +112,7 @@ protected:
 
   void expectAgreementAt(const ArmVector & left, const ArmVector & right)
   {
-    const int key_id = requireId(*model_, mjOBJ_KEY, "teleop_home");
-    mj_resetDataKeyframe(model_.get(), data_.get(), key_id);
+    mj_resetData(model_.get(), data_.get());
     setArm(pinocchio_.jointNames(ArmSide::Left), left);
     setArm(pinocchio_.jointNames(ArmSide::Right), right);
     mj_forward(model_.get(), data_.get());
@@ -141,6 +141,56 @@ TEST_F(ModelAgreementTest, WristAndElbowFramesAgreeAtPerturbedConfiguration)
   const ArmVector right = rightHome() +
     ArmVector(-0.10, 0.06, -0.16, 0.14, -0.15, -0.08, 0.12);
   expectAgreementAt(left, right);
+}
+
+TEST_F(ModelAgreementTest, StartupHomeSweepHasNoTableContact)
+{
+  ArmVector zero = ArmVector::Zero();
+  ArmVector left_transition;
+  left_transition << 1.00, 1.20, 0.0, -1.20, 0.0, 0.0, 0.0;
+  ArmVector right_transition;
+  right_transition << 1.00, -1.20, 0.0, -1.20, 0.0, 0.0, 0.0;
+
+  auto quintic = [](double u) {
+      u = std::clamp(u, 0.0, 1.0);
+      return u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+    };
+  const auto left_names = pinocchio_.jointNames(ArmSide::Left);
+  const auto right_names = pinocchio_.jointNames(ArmSide::Right);
+
+  for (int segment = 0; segment < 2; ++segment) {
+    for (int sample = 0; sample <= 100; ++sample) {
+      const double s = quintic(static_cast<double>(sample) / 100.0);
+      const ArmVector left = segment == 0 ?
+        zero + s * (left_transition - zero) :
+        left_transition + s * (leftHome() - left_transition);
+      const ArmVector right = segment == 0 ?
+        zero + s * (right_transition - zero) :
+        right_transition + s * (rightHome() - right_transition);
+      mj_resetData(model_.get(), data_.get());
+      setArm(left_names, left);
+      setArm(right_names, right);
+      mj_forward(model_.get(), data_.get());
+
+      for (int contact = 0; contact < data_->ncon; ++contact) {
+        const auto & collision = data_->contact[contact];
+        const char * first = mj_id2name(
+          model_.get(), mjOBJ_GEOM, collision.geom1);
+        const char * second = mj_id2name(
+          model_.get(), mjOBJ_GEOM, collision.geom2);
+        const auto is_table = [](const char * name) {
+            return name != nullptr && std::string(name).rfind("front_table_", 0) == 0;
+          };
+        ASSERT_FALSE(is_table(first) || is_table(second))
+          << "table contact at segment=" << segment << " sample=" << sample
+          << " geom_ids=(" << collision.geom1 << "," << collision.geom2 << ")"
+          << " pos=(" << collision.pos[0] << "," << collision.pos[1] << ","
+          << collision.pos[2] << ")"
+          << " (" << (first != nullptr ? first : "unknown") << ", "
+          << (second != nullptr ? second : "unknown") << ")";
+      }
+    }
+  }
 }
 
 }  // namespace

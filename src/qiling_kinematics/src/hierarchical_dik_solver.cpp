@@ -33,6 +33,38 @@ Eigen::Vector3d clampVectorNorm(const Eigen::Vector3d & value, double limit)
   return value;
 }
 
+Eigen::Vector3d applyDeadband(const Eigen::Vector3d & value, double deadband)
+{
+  if (!value.allFinite() || !std::isfinite(deadband) || deadband < 0.0) {
+    return Eigen::Vector3d::Zero();
+  }
+  const double norm = value.norm();
+  if (norm <= deadband || norm <= 1.0e-12) {
+    return Eigen::Vector3d::Zero();
+  }
+  return value * ((norm - deadband) / norm);
+}
+
+double singularitySpeedScale(
+  double sigma, double slowdown_start, double stop, double minimum_scale)
+{
+  if (!std::isfinite(sigma) || !std::isfinite(slowdown_start) ||
+    !std::isfinite(stop) || !std::isfinite(minimum_scale) ||
+    slowdown_start <= stop || stop < 0.0 || minimum_scale < 0.0 ||
+    minimum_scale > 1.0)
+  {
+    return 0.0;
+  }
+  if (sigma <= stop) {
+    return minimum_scale;
+  }
+  if (sigma >= slowdown_start) {
+    return 1.0;
+  }
+  const double alpha = (sigma - stop) / (slowdown_start - stop);
+  return minimum_scale + alpha * (1.0 - minimum_scale);
+}
+
 bool finiteInput(const HierarchicalDIKSolver::Input & input)
 {
   return input.jacobian.allFinite() &&
@@ -276,6 +308,14 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
   const Config & config = impl_->config;
   if (!std::isfinite(config.position_gain) || config.position_gain < 0.0 ||
     !std::isfinite(config.max_linear_velocity) || config.max_linear_velocity <= 0.0 ||
+    !std::isfinite(config.position_error_deadband) || config.position_error_deadband < 0.0 ||
+    !std::isfinite(config.position_sigma_slowdown_start) ||
+    !std::isfinite(config.position_sigma_stop) ||
+    config.position_sigma_slowdown_start <= config.position_sigma_stop ||
+    config.position_sigma_stop < 0.0 ||
+    !std::isfinite(config.position_singularity_speed_scale_min) ||
+    config.position_singularity_speed_scale_min < 0.0 ||
+    config.position_singularity_speed_scale_min > 1.0 ||
     !std::isfinite(config.position_regularization) || config.position_regularization < 0.0 ||
     !std::isfinite(config.position_smoothness_weight) ||
     config.position_smoothness_weight < 0.0 ||
@@ -285,13 +325,12 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
     !std::isfinite(config.hard_limit_tolerance) || config.hard_limit_tolerance < 0.0 ||
     !std::isfinite(config.rank_threshold) || config.rank_threshold <= 0.0 ||
     !config.max_joint_velocity_rps.allFinite() ||
-    (config.max_joint_velocity_rps.array() <= 0.0).any())
+    (config.max_joint_velocity_rps.array() <= 0.0).any() ||
+    !config.max_joint_acceleration_rps2.allFinite() ||
+    (config.max_joint_acceleration_rps2.array() <= 0.0).any())
   {
     return result;
   }
-
-  result.desired_linear_velocity = clampVectorNorm(
-    config.position_gain * input.position_error, config.max_linear_velocity);
 
   const Eigen::JacobiSVD<ArmLinearJacobian> position_svd(input.jacobian);
   const auto & position_singular_values = position_svd.singularValues();
@@ -305,6 +344,13 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
       ++result.position_rank;
     }
   }
+  result.position_speed_scale = singularitySpeedScale(
+    result.position_sigma_min, config.position_sigma_slowdown_start,
+    config.position_sigma_stop, config.position_singularity_speed_scale_min);
+  result.desired_linear_velocity = result.position_speed_scale * clampVectorNorm(
+    config.position_gain * applyDeadband(
+      input.position_error, config.position_error_deadband),
+    config.max_linear_velocity);
 
   const Eigen::Matrix<double, kSingleArmDof, kSingleArmDof> identity =
     Eigen::Matrix<double, kSingleArmDof, kSingleArmDof>::Identity();
@@ -360,6 +406,19 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
       upper = std::min(upper, damped_upper);
       result.joint_limit_damper_active =
         result.joint_limit_damper_active || lower_scale < 1.0 || upper_scale < 1.0;
+    }
+
+    // Bound the per-cycle velocity change as well as the velocity itself.
+    // If a discontinuous measured-state jump makes the intersection empty,
+    // retain the already-feasible position/velocity bounds for this tick.
+    const double acceleration_limit = config.max_joint_acceleration_rps2[i] * input.dt;
+    const double acceleration_lower = input.qdot_previous[i] - acceleration_limit;
+    const double acceleration_upper = input.qdot_previous[i] + acceleration_limit;
+    const double bounded_lower = std::max(lower, acceleration_lower);
+    const double bounded_upper = std::min(upper, acceleration_upper);
+    if (bounded_lower <= bounded_upper) {
+      lower = bounded_lower;
+      upper = bounded_upper;
     }
 
     impl_->qp.model.l_box[i] = lower;
@@ -440,6 +499,15 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePoseHierarchy(
   const Config & config = impl_->config;
   if (!std::isfinite(config.rotation_gain) || config.rotation_gain < 0.0 ||
     !std::isfinite(config.max_angular_velocity) || config.max_angular_velocity <= 0.0 ||
+    !std::isfinite(config.orientation_error_deadband) ||
+    config.orientation_error_deadband < 0.0 ||
+    !std::isfinite(config.wrist_sigma_slowdown_start) ||
+    !std::isfinite(config.wrist_sigma_stop) ||
+    config.wrist_sigma_slowdown_start <= config.wrist_sigma_stop ||
+    config.wrist_sigma_stop < 0.0 ||
+    !std::isfinite(config.orientation_singularity_speed_scale_min) ||
+    config.orientation_singularity_speed_scale_min < 0.0 ||
+    config.orientation_singularity_speed_scale_min > 1.0 ||
     !std::isfinite(config.orientation_regularization) ||
     config.orientation_regularization < 0.0 ||
     !std::isfinite(config.orientation_smoothness_weight) ||
@@ -499,10 +567,36 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePoseHierarchy(
     }
   }
 
+  result.orientation_speed_scale = singularitySpeedScale(
+    result.wrist_sigma_min, config.wrist_sigma_slowdown_start,
+    config.wrist_sigma_stop, config.orientation_singularity_speed_scale_min);
+
+  // A position singularity is a primary-task safety condition. A severely
+  // ill-conditioned full wrist also cannot provide a reliable orientation
+  // correction. Keep the valid primary result and do not inject a noisy
+  // secondary command in either case.
+  if (result.position_sigma_min <= config.position_sigma_stop) {
+    result.orientation_status = SolverStatus::SingularityRejected;
+    return result;
+  }
+  if (result.wrist_rank != kCartesianDof) {
+    result.orientation_status = SolverStatus::RankDeficient;
+    if (input.elbow_geometry_valid) {
+      result.elbow_status = SolverStatus::RankDeficient;
+    }
+    return result;
+  }
+  if (result.wrist_sigma_min <= config.wrist_sigma_stop) {
+    result.orientation_status = SolverStatus::SingularityRejected;
+    return result;
+  }
+
   const ReducedOrientationJacobian reduced_jacobian =
     input.angular_jacobian * null_basis;
-  result.desired_angular_velocity = clampVectorNorm(
-    config.rotation_gain * input.orientation_error, config.max_angular_velocity);
+  result.desired_angular_velocity = result.orientation_speed_scale * clampVectorNorm(
+    config.rotation_gain * applyDeadband(
+      input.orientation_error, config.orientation_error_deadband),
+    config.max_angular_velocity);
   const Eigen::Vector3d angular_residual =
     result.desired_angular_velocity - input.angular_jacobian * result.qdot_position;
 

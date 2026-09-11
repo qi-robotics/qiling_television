@@ -87,23 +87,13 @@ private:
     bool modelTableFlag_ = true;
     bool fixedBase_ = false;
     bool freezeLegs_ = false;
-    bool homeTransitionEnabled_ = true;
     bool externalCommandReceived_ = false;
-    double homeTransitionKp_ = 70.0;
-    double homeTransitionKd_ = 6.0;
-    double homeHoldKp_ = 80.0;
-    double homeHoldKd_ = 8.0;
-    std::string startupKeyframeName_ = "teleop_start";
-    std::string targetKeyframeName_ = "teleop_home";
-    std::vector<std::string> homeTransitionKeyframeNames_;
-    std::vector<double> homeTransitionDurations_;
-    std::vector<std::vector<double>> homeTransitionWaypoints_;
-    std::vector<double> homeTargetPosition_;
-    std::vector<double> homeTransitionPosition_;
-    std::vector<double> homeTransitionVelocity_;
-    bool homeTransitionActive_ = false;
-    size_t homeTransitionSegment_ = 0;
-    double homeTransitionSegmentStartTime_ = 0.0;
+    double idleHoldKp_ = 40.0;
+    double idleHoldKd_ = 2.0;
+    // Safety slew limiter for the torque-like MuJoCo control signal.
+    double maxControlRateNmPerSec_ = 1000.0;
+    std::vector<double> previousControl_;
+    std::vector<double> idleHoldPosition_;
     int floatingBaseJointId_ = -1;
     std::vector<double> floatingBaseQpos_;
     std::vector<lockedJointState> lockedLegJoints_;
@@ -116,6 +106,7 @@ private:
         std::shared_ptr<std_srvs::srv::Empty::Response> response);
     void ReadModel();
     void ShowModel();
+    void InitializeZeroActuatedState();
     
 public:
     RCLCPP_SMART_PTR_DEFINITIONS(SimulateBridge); // 用于生成智能指针 
@@ -126,15 +117,11 @@ public:
     // 该函数只修改仿真状态，不改变 /human_lower_command 消息长度。
     void ApplyKinematicLocks();
     bool IsFrozenLegActuator(size_t actuatorIndex) const;
-    void StartHomeTransition();
-    void UpdateHomeTransition(double simTime);
-    bool GetHomeTransitionTarget(size_t actuatorIndex, double & position, double & velocity) const;
-    bool GetHomeHoldTarget(size_t actuatorIndex, double & position) const;
+    bool GetIdleHoldTarget(size_t actuatorIndex, double & position) const;
     bool HasExternalCommand() const { return externalCommandReceived_; }
-    double HomeTransitionKp() const { return homeTransitionKp_; }
-    double HomeTransitionKd() const { return homeTransitionKd_; }
-    double HomeHoldKp() const { return homeHoldKp_; }
-    double HomeHoldKd() const { return homeHoldKd_; }
+    double LimitControlRate(size_t actuatorIndex, double desired, double dt);
+    double IdleHoldKp() const { return idleHoldKp_; }
+    double IdleHoldKd() const { return idleHoldKd_; }
 
     SimulateBridge(mjData* d, mjModel* m, mujoco::Simulate& sim);
     ~SimulateBridge();

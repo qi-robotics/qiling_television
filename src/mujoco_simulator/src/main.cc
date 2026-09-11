@@ -389,7 +389,6 @@ void PDControllerCallBack(const mjModel* m, mjData* d){
   rclcpp::spin_some(SimulateBridgeNodePtr);
   // 获取命令
   mit_msgs::msg::MITJointCommands cmd = SimulateBridgeNodePtr->GetJointCommands();
-  SimulateBridgeNodePtr->UpdateHomeTransition(d->time);
   // 运行PD控制器
   for(size_t i = 0; i < m->nu; i++){
     // 腿部仅用于显示，不接受外部 MIT 命令。随后由
@@ -397,20 +396,15 @@ void PDControllerCallBack(const mjModel* m, mjData* d){
     if (SimulateBridgeNodePtr->IsFrozenLegActuator(i)) {
       d->ctrl[i] = 0.0;
     } else {
-      double transitionPosition = 0.0;
-      double transitionVelocity = 0.0;
-      double holdPosition = 0.0;
-      if (SimulateBridgeNodePtr->GetHomeTransitionTarget(
-          i, transitionPosition, transitionVelocity)) {
-        d->ctrl[i] = SimulateBridgeNodePtr->HomeTransitionKp() *
-              (transitionPosition - d->sensordata[i + 0 * m->nu])
-            + SimulateBridgeNodePtr->HomeTransitionKd() *
-              (transitionVelocity - d->sensordata[i + 1 * m->nu]);
-      } else if (!SimulateBridgeNodePtr->HasExternalCommand() &&
-                 SimulateBridgeNodePtr->GetHomeHoldTarget(i, holdPosition)) {
-        d->ctrl[i] = SimulateBridgeNodePtr->HomeHoldKp() *
-              (holdPosition - d->sensordata[i + 0 * m->nu])
-            - SimulateBridgeNodePtr->HomeHoldKd() *
+      double idleHoldPosition = 0.0;
+      if (!SimulateBridgeNodePtr->HasExternalCommand() &&
+          SimulateBridgeNodePtr->GetIdleHoldTarget(i, idleHoldPosition)) {
+        // 在 qiling_kinematics 启动前保持全零姿态，避免仅解除暂停就因
+        // 重力导致双臂下落。该保持不是 home 流程，收到首个外部命令后
+        // 立即交由 qiling_kinematics 的 home 状态机控制。
+        d->ctrl[i] = SimulateBridgeNodePtr->IdleHoldKp() *
+              (idleHoldPosition - d->sensordata[i + 0 * m->nu])
+            - SimulateBridgeNodePtr->IdleHoldKd() *
               d->sensordata[i + 1 * m->nu];
       } else if (i < cmd.commands.size()) {
       d->ctrl[i] = cmd.commands[i].kp * (cmd.commands[i].pos - d->sensordata[i + 0 * m->nu])
@@ -429,6 +423,11 @@ void PDControllerCallBack(const mjModel* m, mjData* d){
       d->ctrl[i] = std::clamp(
         d->ctrl[i], m->actuator_ctrlrange[2 * i], m->actuator_ctrlrange[2 * i + 1]);
     }
+    // Limit abrupt changes in the torque-like actuator command. This is a
+    // simulator-side safeguard for the same kind of command slew limiter
+    // that must exist in the real MIT command path.
+    d->ctrl[i] = SimulateBridgeNodePtr->LimitControlRate(
+      i, d->ctrl[i], m->opt.timestep);
   }
 }
 

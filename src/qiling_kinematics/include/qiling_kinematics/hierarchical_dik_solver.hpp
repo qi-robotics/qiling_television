@@ -26,9 +26,19 @@ public:
     double max_position_error{0.25};
     double max_rotation_error{1.2};
     double max_linear_velocity{0.20};
+    // Library defaults stay neutral; teleoperation enables the protective
+    // deadbands explicitly in differential_ik.yaml.
+    double position_error_deadband{0.0};
+    double position_sigma_slowdown_start{0.05};
+    double position_sigma_stop{0.0};
+    double position_singularity_speed_scale_min{0.0};
     double position_regularization{1.0e-4};
     double position_smoothness_weight{1.0e-3};
     double max_angular_velocity{0.80};
+    double orientation_error_deadband{0.0};
+    double wrist_sigma_slowdown_start{0.08};
+    double wrist_sigma_stop{0.0};
+    double orientation_singularity_speed_scale_min{0.0};
     double orientation_regularization{1.0e-4};
     double orientation_smoothness_weight{1.0e-3};
     double rank_threshold{1.0e-4};
@@ -49,6 +59,9 @@ public:
     double joint_limit_damper_gain{1.0};
     double hard_limit_tolerance{0.005};
     ArmVector max_joint_velocity_rps{ArmVector::Constant(1.5)};
+    // Keep the library default backwards-compatible; the runtime YAML sets
+    // the finite safety values used by teleoperation.
+    ArmVector max_joint_acceleration_rps2{ArmVector::Constant(1.0e6)};
     int qp_max_iter{80};
     double qp_eps_abs{1.0e-5};
     double qp_eps_rel{1.0e-5};
@@ -120,6 +133,8 @@ public:
     double wrist_sigma_min{0.0};
     double wrist_sigma_max{0.0};
     double wrist_condition_number{0.0};
+    double position_speed_scale{1.0};
+    double orientation_speed_scale{1.0};
     SolverStatus elbow_status{SolverStatus::InvalidInput};
     bool elbow_applied{false};
     double elbow_scale{0.0};

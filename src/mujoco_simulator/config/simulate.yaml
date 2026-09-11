@@ -24,19 +24,9 @@ mujoco_simulator:
     fixedBase: true
     freezeLegs: true
 
-    # 启动后从安全起始姿态平滑过渡到目标 home，避免双臂直接张开。
-    startupKeyframe: "teleop_start"
-    targetKeyframe: "teleop_home"
-    homeTransitionEnabled: true
-    homeTransitionKeyframes:
-      - "teleop_start"
-      - "teleop_elbow_lift"
-      - "teleop_shoulder_rear"
-      - "teleop_home"
-    homeTransitionDurations: [0.8, 1.0, 1.2]
-    # Conservative high-level gains for the small-inertia O6 hinges.
-    # The MuJoCo motors already provide the inner torque actuation.
-    homeTransitionKp: 35.0
-    homeTransitionKd: 4.0
-    homeHoldKp: 30.0
-    homeHoldKd: 4.0
+    # Home 由 qiling_kinematics 唯一执行。MuJoCo 在收到首个外部命令前
+    # 只保持启动时的全零可驱动关节状态，不读取或重置 XML keyframe。
+    idleHoldKp: 40.0
+    idleHoldKd: 2.0
+    # Maximum change of the torque-like d.ctrl signal per second.
+    maxControlRateNmPerSec: 1000.0

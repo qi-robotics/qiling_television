@@ -41,7 +41,10 @@ constexpr int kLeftSide = 0;
 constexpr int kRightSide = 1;
 constexpr int kCommandSize = 40;
 constexpr int kLeftArmCommandOffset = 12;
+constexpr int kLeftHandCommandOffset = 19;
 constexpr int kRightArmCommandOffset = 26;
+constexpr int kRightHandCommandOffset = 33;
+constexpr int kHandDof = 7;
 
 using Clock = std::chrono::steady_clock;
 using PoseMsg = geometry_msgs::msg::PoseStamped;
@@ -68,6 +71,43 @@ struct TimedTarget
   Clock::time_point received_at{};
   bool received{false};
 };
+
+struct WorkspaceGuardState
+{
+  double bad_duration_sec{0.0};
+};
+
+enum class StartupHomePhase
+{
+  WaitingForState,
+  MoveToTransition,
+  SettleAtTransition,
+  MoveToHome,
+  SettleAtHome,
+  Complete,
+  Fault,
+};
+
+const char * toString(StartupHomePhase phase)
+{
+  switch (phase) {
+    case StartupHomePhase::WaitingForState:
+      return "WAITING_FOR_STATE";
+    case StartupHomePhase::MoveToTransition:
+      return "MOVE_TO_TRANSITION";
+    case StartupHomePhase::SettleAtTransition:
+      return "SETTLE_AT_TRANSITION";
+    case StartupHomePhase::MoveToHome:
+      return "MOVE_TO_HOME";
+    case StartupHomePhase::SettleAtHome:
+      return "SETTLE_AT_HOME";
+    case StartupHomePhase::Complete:
+      return "COMPLETE";
+    case StartupHomePhase::Fault:
+      return "FAULT";
+  }
+  return "UNKNOWN";
+}
 
 double ageSeconds(Clock::time_point now, Clock::time_point stamp, bool valid)
 {
@@ -143,9 +183,9 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "Differential IK Phase 5.2 ready: nq=%d nv=%d, strict position -> orientation "
-      "null-space QP, feasible limit damper, SVD diagnostics, elbow geometry=DIAGNOSTIC, "
-      "elbow control=%s, %.1f Hz",
+      "Differential IK Phase 6 ready: nq=%d nv=%d, strict position -> orientation "
+      "null-space QP, target/singularity/workspace/slew protection, gravity feedforward, "
+      "elbow geometry=DIAGNOSTIC, elbow control=%s, %.1f Hz",
       static_cast<int>(kinematics_->model().nq),
       static_cast<int>(kinematics_->model().nv),
       get_parameter("elbow_task_enabled").as_bool() ? "ON" : "OFF", rate);
@@ -171,13 +211,28 @@ private:
     declare_parameter("target_timeout_sec", 0.25);
     declare_parameter("joint_state_timeout_sec", 0.20);
     declare_parameter("target_frame", std::string("base_link"));
+    declare_parameter("target_filter_enabled", true);
+    declare_parameter("target_filter_time_constant_sec", 0.04);
+    declare_parameter("workspace_guard_enabled", true);
+    declare_parameter("workspace_guard_error_m", 0.03);
+    declare_parameter("workspace_guard_timeout_sec", 0.25);
+    declare_parameter("workspace_guard_limit_distance_rad", 0.003);
+    declare_parameter("workspace_guard_singularity_sigma", 0.003);
     declare_parameter("orientation_task_enabled", true);
     declare_parameter("position_gain", 3.0);
     declare_parameter("max_linear_velocity_mps", 0.20);
+    declare_parameter("position_error_deadband_m", 0.003);
+    declare_parameter("position_sigma_slowdown_start", 0.05);
+    declare_parameter("position_sigma_stop", 0.003);
+    declare_parameter("position_singularity_speed_scale_min", 0.0);
     declare_parameter("position_regularization", 1.0e-4);
     declare_parameter("position_smoothness_weight", 1.0e-3);
     declare_parameter("rotation_gain", 3.0);
     declare_parameter("max_angular_velocity_rps", 0.80);
+    declare_parameter("orientation_error_deadband_rad", 0.01);
+    declare_parameter("wrist_sigma_slowdown_start", 0.08);
+    declare_parameter("wrist_sigma_stop", 0.005);
+    declare_parameter("orientation_singularity_speed_scale_min", 0.0);
     declare_parameter("orientation_regularization", 1.0e-4);
     declare_parameter("orientation_smoothness_weight", 1.0e-3);
     declare_parameter("rank_threshold", 1.0e-4);
@@ -201,9 +256,13 @@ private:
     declare_parameter("joint_limit_damper_gain", 1.0);
     declare_parameter("hard_limit_tolerance_rad", 0.005);
     declare_parameter("left_q_rest", std::vector<double>{
-      -0.45, 0.30, 0.02, -1.40, 1.40, 0.0, 0.0});
+      0.0, 0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0});
     declare_parameter("right_q_rest", std::vector<double>{
-      -0.45, -0.30, 0.02, -1.40, 1.40, 0.0, 0.0});
+      0.0, -0.1745329252, 0.0, -1.5707963268, 0.0, 0.0, 0.0});
+    declare_parameter("left_home_transition_q", std::vector<double>{
+      1.00, 1.20, 0.0, -1.20, 0.0, 0.0, 0.0});
+    declare_parameter("right_home_transition_q", std::vector<double>{
+      1.00, -1.20, 0.0, -1.20, 0.0, 0.0, 0.0});
     declare_parameter("elbow_geometry_diagnostic_enabled", true);
     declare_parameter("elbow_outward_weight", 1.0);
     declare_parameter("elbow_downward_weight", 0.30);
@@ -212,6 +271,23 @@ private:
     declare_parameter("min_elbow_projection_radius_m", 0.02);
     declare_parameter<std::vector<double>>(
       "max_joint_velocity_rps", {1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2});
+    declare_parameter<std::vector<double>>(
+      "max_joint_acceleration_rps2", {3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0});
+
+    declare_parameter("gravity_compensation_enabled", true);
+    declare_parameter("gravity_torque_scale", 1.0);
+    declare_parameter("gravity_torque_limit_scale", 1.0);
+
+    declare_parameter("startup_home_enabled", true);
+    declare_parameter("home_transition_duration_sec", 2.5);
+    declare_parameter("home_move_duration_sec", 3.0);
+    declare_parameter("home_settle_duration_sec", 0.30);
+    declare_parameter("home_transition_tolerance_rad", 0.08);
+    declare_parameter("home_tolerance_rad", 0.05);
+    declare_parameter("home_settle_timeout_sec", 4.0);
+    declare_parameter("home_log_period_ms", 1000);
+    declare_parameter("o6_home_hold_kp", 5.0);
+    declare_parameter("o6_home_hold_kd", 0.5);
 
     declare_parameter("consecutive_primary_qp_failures_to_fault", 3);
     declare_parameter("log_state_transitions", true);
@@ -243,14 +319,25 @@ private:
           throw std::runtime_error(std::string(parameter_name) + " contains non-finite values");
         }
         return result;
-      };
+    };
     home_q_[kLeftSide] = readRest("left_q_rest");
     home_q_[kRightSide] = readRest("right_q_rest");
+    home_transition_q_[kLeftSide] = readRest("left_home_transition_q");
+    home_transition_q_[kRightSide] = readRest("right_home_transition_q");
     for (int side = 0; side < kSideCount; ++side) {
       const ArmSide arm_side = side == kLeftSide ? ArmSide::Left : ArmSide::Right;
       q_state_[side].setZero();
       q_min_[side] = kinematics_->lowerPositionLimits(arm_side);
       q_max_[side] = kinematics_->upperPositionLimits(arm_side);
+      for (int joint = 0; joint < kSingleArmDof; ++joint) {
+        if (home_q_[side][joint] < q_min_[side][joint] ||
+          home_q_[side][joint] > q_max_[side][joint] ||
+          home_transition_q_[side][joint] < q_min_[side][joint] ||
+          home_transition_q_[side][joint] > q_max_[side][joint])
+        {
+          throw std::runtime_error("startup home or transition pose is outside joint limits");
+        }
+      }
       const auto & names = kinematics_->jointNames(arm_side);
       for (int column = 0; column < kSingleArmDof; ++column) {
         joint_name_to_arm_index_[names[column]] = side * kSingleArmDof + column;
@@ -258,6 +345,7 @@ private:
     }
     const auto home_kinematics = kinematics_->evaluate(
       home_q_[kLeftSide], home_q_[kRightSide]);
+    effort_limits_ = kinematics_->effortLimits();
     const double minimum_radius = get_parameter("min_elbow_projection_radius_m").as_double();
     for (int side = 0; side < kSideCount; ++side) {
       if (!computeHomeElbowDirection(home_kinematics[side], minimum_radius, home_elbow_direction_[side])) {
@@ -271,11 +359,25 @@ private:
     HierarchicalDIKSolver::Config config;
     config.position_gain = get_parameter("position_gain").as_double();
     config.max_linear_velocity = get_parameter("max_linear_velocity_mps").as_double();
+    config.position_error_deadband =
+      get_parameter("position_error_deadband_m").as_double();
+    config.position_sigma_slowdown_start =
+      get_parameter("position_sigma_slowdown_start").as_double();
+    config.position_sigma_stop = get_parameter("position_sigma_stop").as_double();
+    config.position_singularity_speed_scale_min =
+      get_parameter("position_singularity_speed_scale_min").as_double();
     config.position_regularization = get_parameter("position_regularization").as_double();
     config.position_smoothness_weight =
       get_parameter("position_smoothness_weight").as_double();
     config.rotation_gain = get_parameter("rotation_gain").as_double();
     config.max_angular_velocity = get_parameter("max_angular_velocity_rps").as_double();
+    config.orientation_error_deadband =
+      get_parameter("orientation_error_deadband_rad").as_double();
+    config.wrist_sigma_slowdown_start =
+      get_parameter("wrist_sigma_slowdown_start").as_double();
+    config.wrist_sigma_stop = get_parameter("wrist_sigma_stop").as_double();
+    config.orientation_singularity_speed_scale_min =
+      get_parameter("orientation_singularity_speed_scale_min").as_double();
     config.orientation_regularization =
       get_parameter("orientation_regularization").as_double();
     config.orientation_smoothness_weight =
@@ -308,6 +410,14 @@ private:
     for (int i = 0; i < kSingleArmDof; ++i) {
       config.max_joint_velocity_rps[i] = max_joint_velocity[i];
     }
+    const auto max_joint_acceleration =
+      get_parameter("max_joint_acceleration_rps2").as_double_array();
+    if (max_joint_acceleration.size() != kSingleArmDof) {
+      throw std::runtime_error("max_joint_acceleration_rps2 must contain exactly 7 values");
+    }
+    for (int i = 0; i < kSingleArmDof; ++i) {
+      config.max_joint_acceleration_rps2[i] = max_joint_acceleration[i];
+    }
     config.qp_max_iter = get_parameter("qp_max_iter").as_int();
     config.qp_eps_abs = get_parameter("qp_eps_abs").as_double();
     config.qp_eps_rel = get_parameter("qp_eps_rel").as_double();
@@ -326,6 +436,50 @@ private:
       get_parameter("min_shoulder_wrist_distance_m").as_double();
     elbow_config_.min_elbow_projection_radius =
       get_parameter("min_elbow_projection_radius_m").as_double();
+  }
+
+  TimedTarget filteredTarget(int side, const TimedTarget & raw, double dt)
+  {
+    if (!get_parameter("target_filter_enabled").as_bool()) {
+      return raw;
+    }
+    const double time_constant =
+      get_parameter("target_filter_time_constant_sec").as_double();
+    if (!std::isfinite(time_constant) || time_constant <= 0.0) {
+      return raw;
+    }
+    if (!filtered_target_valid_[side]) {
+      filtered_targets_[side] = raw;
+      filtered_target_valid_[side] = true;
+      return filtered_targets_[side];
+    }
+
+    const double alpha = std::clamp(dt / (time_constant + dt), 0.0, 1.0);
+    const Eigen::Vector3d position =
+      (1.0 - alpha) * filtered_targets_[side].pose.translation() +
+      alpha * raw.pose.translation();
+    Eigen::Quaterniond current(filtered_targets_[side].pose.rotation());
+    Eigen::Quaterniond desired(raw.pose.rotation());
+    if (current.dot(desired) < 0.0) {
+      desired.coeffs() *= -1.0;
+    }
+    Eigen::Quaterniond blended = current.slerp(alpha, desired);
+    if (!blended.coeffs().allFinite() || blended.norm() < 1.0e-8 ||
+      !position.allFinite()) {
+      filtered_targets_[side] = raw;
+      return filtered_targets_[side];
+    }
+    blended.normalize();
+    filtered_targets_[side].pose = pinocchio::SE3(blended.toRotationMatrix(), position);
+    filtered_targets_[side].received_at = raw.received_at;
+    filtered_targets_[side].received = raw.received;
+    return filtered_targets_[side];
+  }
+
+  void resetTargetAndGuard(int side)
+  {
+    filtered_target_valid_[side] = false;
+    workspace_guard_[side].bad_duration_sec = 0.0;
   }
 
   void jointStateCallback(const sensor_msgs::msg::JointState::SharedPtr message)
@@ -431,6 +585,171 @@ private:
     requested_modes_[side] = message.data;
   }
 
+  static double maxJointError(
+    const std::array<ArmVector, kSideCount> & measured,
+    const std::array<ArmVector, kSideCount> & target)
+  {
+    double result = 0.0;
+    for (int side = 0; side < kSideCount; ++side) {
+      result = std::max(result, (measured[side] - target[side]).cwiseAbs().maxCoeff());
+    }
+    return result;
+  }
+
+  static void quinticSegment(
+    const ArmVector & start, const ArmVector & end, double elapsed, double duration,
+    ArmVector & position, ArmVector & velocity)
+  {
+    if (!std::isfinite(duration) || duration <= 0.0) {
+      position = end;
+      velocity.setZero();
+      return;
+    }
+    const double u = std::clamp(elapsed / duration, 0.0, 1.0);
+    const double s = u * u * u * (10.0 + u * (-15.0 + 6.0 * u));
+    const double dsdu =
+      30.0 * u * u - 60.0 * u * u * u + 30.0 * u * u * u * u;
+    position = start + s * (end - start);
+    velocity = (dsdu / duration) * (end - start);
+  }
+
+  void setHomePhase(StartupHomePhase phase, const char * reason)
+  {
+    home_phase_ = phase;
+    home_phase_time_sec_ = 0.0;
+    home_settle_time_sec_ = 0.0;
+    RCLCPP_INFO(
+      get_logger(), "startup home phase -> %s (%s)", toString(home_phase_), reason);
+  }
+
+  void beginStartupHome(const std::array<ArmVector, kSideCount> & measured)
+  {
+    home_start_q_ = measured;
+    home_command_q_ = measured;
+    for (auto & velocity : home_command_qdot_) {
+      velocity.setZero();
+    }
+    home_started_ = true;
+    teleop_side_ready_.fill(false);
+    if (get_parameter("startup_home_enabled").as_bool()) {
+      setHomePhase(StartupHomePhase::MoveToTransition, "complete state received");
+    } else {
+      home_command_q_ = home_q_;
+      setHomePhase(StartupHomePhase::Complete, "startup home disabled");
+      home_complete_ = true;
+    }
+  }
+
+  void updateStartupHome(
+    const std::array<ArmVector, kSideCount> & measured, double dt)
+  {
+    if (!home_started_ || home_complete_ || home_phase_ == StartupHomePhase::Fault) {
+      for (int side = 0; side < kSideCount; ++side) {
+        home_command_q_[side] =
+          home_phase_ == StartupHomePhase::Fault ? measured[side] : home_q_[side];
+        home_command_qdot_[side].setZero();
+      }
+      return;
+    }
+
+    const double safe_dt = std::isfinite(dt) && dt > 0.0 ? dt : 0.02;
+    home_phase_time_sec_ += safe_dt;
+    const double transition_duration =
+      std::max(get_parameter("home_transition_duration_sec").as_double(), 0.1);
+    const double home_duration =
+      std::max(get_parameter("home_move_duration_sec").as_double(), 0.1);
+    const double settle_duration =
+      std::max(get_parameter("home_settle_duration_sec").as_double(), 0.0);
+    const double transition_tolerance =
+      std::max(get_parameter("home_transition_tolerance_rad").as_double(), 0.0);
+    const double home_tolerance =
+      std::max(get_parameter("home_tolerance_rad").as_double(), 0.0);
+    const double settle_timeout =
+      std::max(get_parameter("home_settle_timeout_sec").as_double(), 0.1);
+
+    switch (home_phase_) {
+      case StartupHomePhase::MoveToTransition:
+        for (int side = 0; side < kSideCount; ++side) {
+          quinticSegment(
+            home_start_q_[side], home_transition_q_[side], home_phase_time_sec_,
+            transition_duration, home_command_q_[side], home_command_qdot_[side]);
+        }
+        if (home_phase_time_sec_ >= transition_duration) {
+          for (int side = 0; side < kSideCount; ++side) {
+            home_command_q_[side] = home_transition_q_[side];
+            home_command_qdot_[side].setZero();
+          }
+          setHomePhase(StartupHomePhase::SettleAtTransition, "trajectory finished");
+        }
+        break;
+
+      case StartupHomePhase::SettleAtTransition:
+        home_command_q_ = home_transition_q_;
+        for (auto & velocity : home_command_qdot_) {
+          velocity.setZero();
+        }
+        if (maxJointError(measured, home_transition_q_) <= transition_tolerance) {
+          home_settle_time_sec_ += safe_dt;
+          if (home_settle_time_sec_ >= settle_duration) {
+            setHomePhase(StartupHomePhase::MoveToHome, "transition reached");
+          }
+        } else {
+          home_settle_time_sec_ = 0.0;
+        }
+        if (home_phase_time_sec_ >= settle_timeout) {
+          setHomePhase(StartupHomePhase::Fault, "transition pose was not reached");
+        }
+        break;
+
+      case StartupHomePhase::MoveToHome:
+        for (int side = 0; side < kSideCount; ++side) {
+          quinticSegment(
+            home_transition_q_[side], home_q_[side], home_phase_time_sec_, home_duration,
+            home_command_q_[side], home_command_qdot_[side]);
+        }
+        if (home_phase_time_sec_ >= home_duration) {
+          home_command_q_ = home_q_;
+          for (auto & velocity : home_command_qdot_) {
+            velocity.setZero();
+          }
+          setHomePhase(StartupHomePhase::SettleAtHome, "trajectory finished");
+        }
+        break;
+
+      case StartupHomePhase::SettleAtHome:
+        home_command_q_ = home_q_;
+        for (auto & velocity : home_command_qdot_) {
+          velocity.setZero();
+        }
+        if (maxJointError(measured, home_q_) <= home_tolerance) {
+          home_settle_time_sec_ += safe_dt;
+          if (home_settle_time_sec_ >= settle_duration) {
+            home_complete_ = true;
+            setHomePhase(StartupHomePhase::Complete, "home reached");
+            RCLCPP_INFO(
+              get_logger(),
+              "startup home complete; release each Grip once before teleoperation");
+          }
+        } else {
+          home_settle_time_sec_ = 0.0;
+        }
+        if (home_phase_time_sec_ >= settle_timeout) {
+          setHomePhase(StartupHomePhase::Fault, "home pose was not reached");
+        }
+        break;
+
+      case StartupHomePhase::WaitingForState:
+      case StartupHomePhase::Complete:
+      case StartupHomePhase::Fault:
+        home_command_q_ =
+          home_phase_ == StartupHomePhase::Fault ? measured : home_q_;
+        for (auto & velocity : home_command_qdot_) {
+          velocity.setZero();
+        }
+        break;
+    }
+  }
+
   void processArm(
     int side,
     const char * side_name,
@@ -479,6 +798,7 @@ private:
     }
 
     if (!requested_active) {
+      resetTargetAndGuard(side);
       elbow_geometry_[side].reset();
       control.enterHold(measured, false, "Grip released");
       finishArmCycle(side_name, previous_state, control, diagnostics);
@@ -487,6 +807,7 @@ private:
 
     const double target_timeout = get_parameter("target_timeout_sec").as_double();
     if (!target.received || !std::isfinite(target_age) || target_age > target_timeout) {
+      resetTargetAndGuard(side);
       control.enterHold(measured, true, "target timeout");
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
@@ -496,6 +817,8 @@ private:
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
     }
+
+    const TimedTarget control_target = filteredTarget(side, target, dt);
 
     const bool orientation_enabled = get_parameter("orientation_task_enabled").as_bool();
     const bool elbow_task_enabled =
@@ -522,7 +845,7 @@ private:
     HierarchicalDIKSolver::PositionInput position_input;
     position_input.jacobian = arm_kinematics.wrist_jacobian.topRows<3>();
     position_input.position_error =
-      target.pose.translation() - arm_kinematics.wrist_pose.translation();
+      control_target.pose.translation() - arm_kinematics.wrist_pose.translation();
     position_input.q_measured = measured;
     position_input.q_min = q_min_[side];
     position_input.q_max = q_max_[side];
@@ -535,7 +858,7 @@ private:
       pose_input.position = position_input;
       pose_input.angular_jacobian = arm_kinematics.wrist_jacobian.bottomRows<3>();
       pose_input.orientation_error = pinocchio::log3(
-        target.pose.rotation() * arm_kinematics.wrist_pose.rotation().transpose());
+        control_target.pose.rotation() * arm_kinematics.wrist_pose.rotation().transpose());
       if (elbow_task_enabled && elbow_output.valid) {
         pose_input.elbow_geometry_valid = true;
         pose_input.elbow_swivel_error = elbow_output.signed_swivel_error;
@@ -563,9 +886,11 @@ private:
     diagnostics.position_rank = result.position_rank;
     diagnostics.position_sigma_min = result.position_sigma_min;
     diagnostics.position_condition_number = result.position_condition_number;
+    diagnostics.position_speed_scale = result.position_speed_scale;
     diagnostics.wrist_rank = result.wrist_rank;
     diagnostics.wrist_sigma_min = result.wrist_sigma_min;
     diagnostics.wrist_condition_number = result.wrist_condition_number;
+    diagnostics.orientation_speed_scale = result.orientation_speed_scale;
     diagnostics.elbow_status = result.elbow_status;
     diagnostics.elbow_applied = result.elbow_applied;
     diagnostics.elbow_scale = result.elbow_scale;
@@ -581,6 +906,37 @@ private:
         measured,
         get_parameter("consecutive_primary_qp_failures_to_fault").as_int(),
         std::string("position-primary QP ") + qiling_kinematics::toString(result.status));
+      diagnostics.command_held = true;
+      finishArmCycle(side_name, previous_state, control, diagnostics);
+      return;
+    }
+
+    const bool guard_enabled = get_parameter("workspace_guard_enabled").as_bool();
+    const double guard_error = get_parameter("workspace_guard_error_m").as_double();
+    const double guard_timeout = get_parameter("workspace_guard_timeout_sec").as_double();
+    const double guard_limit_distance =
+      get_parameter("workspace_guard_limit_distance_rad").as_double();
+    const double guard_sigma =
+      get_parameter("workspace_guard_singularity_sigma").as_double();
+    const bool guard_parameters_valid =
+      std::isfinite(guard_error) && guard_error >= 0.0 &&
+      std::isfinite(guard_timeout) && guard_timeout > 0.0 &&
+      std::isfinite(guard_limit_distance) && guard_limit_distance >= 0.0 &&
+      std::isfinite(guard_sigma) && guard_sigma >= 0.0;
+    const bool persistent_boundary_request = guard_parameters_valid &&
+      result.position_error_norm > guard_error &&
+      (result.min_hard_limit_distance_rad <= guard_limit_distance ||
+      result.position_sigma_min <= guard_sigma);
+    if (guard_enabled && persistent_boundary_request) {
+      workspace_guard_[side].bad_duration_sec += dt;
+    } else {
+      workspace_guard_[side].bad_duration_sec = 0.0;
+    }
+    if (guard_enabled && guard_parameters_valid &&
+      workspace_guard_[side].bad_duration_sec >= guard_timeout)
+    {
+      control.enterHold(measured, true, "unreachable target or workspace boundary");
+      diagnostics.qdot.setZero();
       diagnostics.command_held = true;
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
@@ -618,11 +974,11 @@ private:
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(),
         get_parameter("diagnostics_log_period_ms").as_int(),
-        "%s Phase 5.2 geometry valid=%s swivel_error=%.4f rad preferred=(%.2f,%.2f,%.2f); "
+        "%s Phase 6 geometry valid=%s swivel_error=%.4f rad preferred=(%.2f,%.2f,%.2f); "
         "position=%.4f m orientation=%.4f rad orientation_status=%s "
         "orientation_applied=%s elbow_status=%s elbow_applied=%s elbow_scale=%.2f "
         "elbow_degradation=(%.6f m/s,%.6f rad/s) damper=%s limit_distance=%.4f rad "
-        "sigma_position=%.5f sigma_wrist=%.5f solve=%.1f us",
+        "sigma_position=%.5f sigma_wrist=%.5f speed=(%.2f,%.2f) solve=%.1f us",
         side_name, diagnostics.elbow_geometry_valid ? "true" : "false",
         diagnostics.elbow_swivel_error_rad,
         diagnostics.elbow_preferred_direction.x(),
@@ -641,6 +997,8 @@ private:
         result.min_hard_limit_distance_rad,
         result.position_sigma_min,
         result.wrist_sigma_min,
+        result.position_speed_scale,
+        result.orientation_speed_scale,
         result.solve_time_us);
     }
   }
@@ -668,6 +1026,7 @@ private:
       get_parameter("diagnostics_log_period_ms").as_int(),
       "%s state=%s held=%s solver=%s target_age=%.3f state_age=%.3f qdot_max=%.3f "
       "damper=%s limit_distance=%.4f sigma_position=%.5f sigma_wrist=%.5f "
+      "speed=(%.2f,%.2f) "
       "elbow_valid=%s swivel=%.4f elbow_status=%s elbow_applied=%s elbow_scale=%.2f",
       side_name,
       qiling_kinematics::toString(control.state()),
@@ -680,6 +1039,8 @@ private:
       diagnostics.min_hard_limit_distance_rad,
       diagnostics.position_sigma_min,
       diagnostics.wrist_sigma_min,
+      diagnostics.position_speed_scale,
+      diagnostics.orientation_speed_scale,
       diagnostics.elbow_geometry_valid ? "true" : "false",
       diagnostics.elbow_swivel_error_rad,
       qiling_kinematics::toString(diagnostics.elbow_status),
@@ -735,6 +1096,8 @@ private:
 
     const auto arm_kinematics = kinematics_->evaluate(
       q_snapshot[kLeftSide], q_snapshot[kRightSide]);
+    gravity_torques_ = kinematics_->gravityTorques(
+      q_snapshot[kLeftSide], q_snapshot[kRightSide]);
 
     const std::array<double, kSideCount> state_age = {
       ageSeconds(now_steady, state_times[kLeftSide], state_received[kLeftSide]),
@@ -750,14 +1113,54 @@ private:
       state_received[kRightSide] && state_age[kRightSide] <= state_timeout;
     publishCurrentState(arm_kinematics, left_state_fresh, right_state_fresh);
 
+    // Startup home is deliberately owned by this node. The XR bridge may
+    // already be receiving Quest data, but all target/mode requests are
+    // ignored until both arms have reached the home pose.
+    if (!home_complete_) {
+      if (!left_state_fresh || !right_state_fresh) {
+        if (home_started_) {
+          if (home_phase_ != StartupHomePhase::Fault) {
+            setHomePhase(
+              StartupHomePhase::Fault, "joint state became stale during startup home");
+          }
+          home_command_q_ = q_snapshot;
+          for (auto & velocity : home_command_qdot_) {
+            velocity.setZero();
+          }
+          publishCommand(home_command_q_, home_command_qdot_, true);
+        }
+        return;
+      }
+      if (!home_started_) {
+        beginStartupHome(q_snapshot);
+      }
+      updateStartupHome(q_snapshot, dt);
+      publishCommand(home_command_q_, home_command_qdot_, true);
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), get_parameter("home_log_period_ms").as_int(),
+        "startup home phase=%s error=%.4f rad", toString(home_phase_),
+        maxJointError(q_snapshot, home_phase_ == StartupHomePhase::MoveToTransition ||
+          home_phase_ == StartupHomePhase::SettleAtTransition ?
+          home_transition_q_ : home_q_));
+      return;
+    }
+
+    // A Grip already held while home was running must not cause a jump. Each
+    // side becomes eligible only after its own Grip has been released once.
+    for (int side = 0; side < kSideCount; ++side) {
+      if (modes[side] == 0) {
+        teleop_side_ready_[side] = true;
+      }
+    }
+
     processArm(
       kLeftSide, "left", arm_kinematics[kLeftSide], q_snapshot[kLeftSide],
-      targets[kLeftSide], modes[kLeftSide] != 0,
+      targets[kLeftSide], teleop_side_ready_[kLeftSide] && modes[kLeftSide] != 0,
       state_received[kLeftSide], state_age[kLeftSide], target_age[kLeftSide],
       control_stalled, dt, left_control_, *left_solver_, left_diagnostics_);
     processArm(
       kRightSide, "right", arm_kinematics[kRightSide], q_snapshot[kRightSide],
-      targets[kRightSide], modes[kRightSide] != 0,
+      targets[kRightSide], teleop_side_ready_[kRightSide] && modes[kRightSide] != 0,
       state_received[kRightSide], state_age[kRightSide], target_age[kRightSide],
       control_stalled, dt, right_control_, *right_solver_, right_diagnostics_);
 
@@ -771,6 +1174,18 @@ private:
   }
 
   void publishCommand()
+  {
+    const std::array<ArmVector, kSideCount> references = {
+      left_control_.reference(), right_control_.reference()};
+    const std::array<ArmVector, kSideCount> velocities = {
+      ArmVector::Zero(), ArmVector::Zero()};
+    publishCommand(references, velocities);
+  }
+
+  void publishCommand(
+    const std::array<ArmVector, kSideCount> & references,
+    const std::array<ArmVector, kSideCount> & velocities,
+    bool hold_o6_zero = false)
   {
     mit_msgs::msg::MITJointCommands command;
     command.commands.resize(kCommandSize);
@@ -786,19 +1201,58 @@ private:
       joint.eff = 0.0F;
     }
 
+    if (hold_o6_zero) {
+      const float o6_kp = static_cast<float>(get_parameter("o6_home_hold_kp").as_double());
+      const float o6_kd = static_cast<float>(get_parameter("o6_home_hold_kd").as_double());
+      for (int i = 0; i < kHandDof; ++i) {
+        command.commands[kLeftHandCommandOffset + i].kp = o6_kp;
+        command.commands[kLeftHandCommandOffset + i].kd = o6_kd;
+        command.commands[kRightHandCommandOffset + i].kp = o6_kp;
+        command.commands[kRightHandCommandOffset + i].kd = o6_kd;
+      }
+    }
+
     for (int i = 0; i < kSingleArmDof; ++i) {
       command.commands[kLeftArmCommandOffset + i].kp = kp;
       command.commands[kLeftArmCommandOffset + i].kd = kd;
       command.commands[kLeftArmCommandOffset + i].pos =
-        static_cast<float>(left_control_.reference()[i]);
+        static_cast<float>(references[kLeftSide][i]);
+      command.commands[kLeftArmCommandOffset + i].vel =
+        static_cast<float>(velocities[kLeftSide][i]);
+      command.commands[kLeftArmCommandOffset + i].eff = static_cast<float>(
+        gravityFeedforward(kLeftSide, i));
 
       command.commands[kRightArmCommandOffset + i].kp = kp;
       command.commands[kRightArmCommandOffset + i].kd = kd;
       command.commands[kRightArmCommandOffset + i].pos =
-        static_cast<float>(right_control_.reference()[i]);
+        static_cast<float>(references[kRightSide][i]);
+      command.commands[kRightArmCommandOffset + i].vel =
+        static_cast<float>(velocities[kRightSide][i]);
+      command.commands[kRightArmCommandOffset + i].eff = static_cast<float>(
+        gravityFeedforward(kRightSide, i));
     }
 
     command_pub_->publish(command);
+  }
+
+  double gravityFeedforward(int side, int joint) const
+  {
+    if (!get_parameter("gravity_compensation_enabled").as_bool() ||
+      side < 0 || side >= kSideCount || joint < 0 || joint >= kSingleArmDof)
+    {
+      return 0.0;
+    }
+    const double scale = get_parameter("gravity_torque_scale").as_double();
+    const double limit_scale = get_parameter("gravity_torque_limit_scale").as_double();
+    const double effort_limit = effort_limits_[side][joint];
+    const double torque = scale * gravity_torques_[side][joint];
+    if (!std::isfinite(scale) || !std::isfinite(limit_scale) ||
+      scale < 0.0 || limit_scale < 0.0 || !std::isfinite(torque) ||
+      !std::isfinite(effort_limit) || effort_limit <= 0.0)
+    {
+      return 0.0;
+    }
+    return std::clamp(torque, -limit_scale * effort_limit, limit_scale * effort_limit);
   }
 
   PoseMsg makePoseMessage(const pinocchio::SE3 & pose) const
@@ -835,7 +1289,16 @@ private:
   std::array<ArmVector, kSideCount> q_min_{};
   std::array<ArmVector, kSideCount> q_max_{};
   std::array<ArmVector, kSideCount> home_q_{};
+  std::array<ArmVector, kSideCount> home_transition_q_{};
+  std::array<ArmVector, kSideCount> home_start_q_{};
+  std::array<ArmVector, kSideCount> home_command_q_{};
+  std::array<ArmVector, kSideCount> home_command_qdot_{};
+  std::array<ArmVector, kSideCount> gravity_torques_{};
+  std::array<ArmVector, kSideCount> effort_limits_{};
   std::array<Eigen::Vector3d, kSideCount> home_elbow_direction_{};
+  std::array<TimedTarget, kSideCount> filtered_targets_{};
+  std::array<bool, kSideCount> filtered_target_valid_{};
+  std::array<WorkspaceGuardState, kSideCount> workspace_guard_{};
   std::unordered_map<std::string, int> joint_name_to_arm_index_;
 
   std::unique_ptr<HierarchicalDIKSolver> left_solver_;
@@ -849,11 +1312,18 @@ private:
 
   std::array<TimedTarget, kSideCount> targets_{};
   std::array<uint8_t, kSideCount> requested_modes_{};
+  std::array<bool, kSideCount> teleop_side_ready_{};
   std::array<bool, kSideCount> arm_state_received_{};
   std::array<Clock::time_point, kSideCount> last_arm_state_time_{};
   std::mutex state_mutex_;
   std::mutex target_mutex_;
   std::mutex mode_mutex_;
+
+  StartupHomePhase home_phase_{StartupHomePhase::WaitingForState};
+  bool home_started_{false};
+  bool home_complete_{false};
+  double home_phase_time_sec_{0.0};
+  double home_settle_time_sec_{0.0};
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
   rclcpp::Subscription<PoseMsg>::SharedPtr left_target_sub_;

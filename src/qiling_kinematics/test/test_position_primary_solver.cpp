@@ -201,4 +201,53 @@ TEST(PositionPrimarySolver, NonfiniteInputFailsWithZeroCommand)
   EXPECT_TRUE(result.desired_linear_velocity.isZero(0.0));
 }
 
+TEST(PositionPrimarySolver, DeadbandSuppressesSmallCartesianNoise)
+{
+  auto config = unregularizedConfig();
+  config.position_error_deadband = 0.005;
+  HierarchicalDIKSolver solver(config);
+  auto input = nominalInput();
+  input.position_error << 0.003, -0.002, 0.001;
+
+  const auto result = solver.solvePositionPrimary(input);
+  ASSERT_TRUE(result.success);
+  EXPECT_TRUE(result.desired_linear_velocity.isZero(0.0));
+  EXPECT_TRUE(result.qdot.isZero(1.0e-9));
+}
+
+TEST(PositionPrimarySolver, AccelerationBoundLimitsVelocityChange)
+{
+  auto config = unregularizedConfig();
+  config.max_joint_acceleration_rps2.setConstant(0.5);
+  HierarchicalDIKSolver solver(config);
+  auto input = nominalInput();
+  input.position_error.setConstant(1.0);
+  input.qdot_previous.setConstant(0.02);
+
+  const auto result = solver.solvePositionPrimary(input);
+  ASSERT_TRUE(result.success);
+  for (int i = 0; i < kSingleArmDof; ++i) {
+    EXPECT_LE(
+      std::abs(result.qdot[i] - input.qdot_previous[i]),
+      config.max_joint_acceleration_rps2[i] * input.dt + 1.0e-10);
+  }
+}
+
+TEST(PositionPrimarySolver, SingularityScaleReducesCommand)
+{
+  auto config = unregularizedConfig();
+  config.position_sigma_slowdown_start = 0.10;
+  config.position_sigma_stop = 0.01;
+  config.position_singularity_speed_scale_min = 0.0;
+  HierarchicalDIKSolver solver(config);
+  auto input = nominalInput();
+  input.jacobian.block<3, 3>(0, 0) *= 0.055;
+  input.position_error.x() = 0.10;
+
+  const auto result = solver.solvePositionPrimary(input);
+  ASSERT_TRUE(result.success);
+  EXPECT_NEAR(result.position_speed_scale, 0.5, 1.0e-12);
+  EXPECT_NEAR(result.desired_linear_velocity.x(), 0.10, 1.0e-12);
+}
+
 }  // namespace
