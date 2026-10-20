@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="21">
+    <General>
+      <Interfaces>
+        <!-- Replace with the NX interface connected to the robot board. -->
+        <NetworkInterface name="REPLACE_WITH_NX_ETHERNET_INTERFACE" priority="default" multicast="default" />
+      </Interfaces>
+    </General>
+  </Domain>
+</CycloneDDS>

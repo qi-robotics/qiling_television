@@ -39,15 +39,46 @@ target_link_libraries(qiling_dik_real_core PUBLIC
 )
 target_compile_features(qiling_dik_real_core PUBLIC cxx_std_17)
 
-find_library(PXREA_ROBOT_SDK
-  NAMES PXREARobotSDK
-  PATHS /opt/apps/roboticsservice/SDK/x64
-  NO_DEFAULT_PATH
-)
-if(NOT PXREA_ROBOT_SDK)
-  message(FATAL_ERROR
-    "XRoboToolkit SDK not found. Expected /opt/apps/roboticsservice/SDK/x64/libPXREARobotSDK.so")
+set(PXREA_SDK_ROOT "/opt/apps/roboticsservice/SDK" CACHE PATH "XRoboToolkit SDK root")
+if(DEFINED ENV{PXREA_SDK_ROOT} AND NOT "$ENV{PXREA_SDK_ROOT}" STREQUAL "")
+  set(PXREA_SDK_ROOT "$ENV{PXREA_SDK_ROOT}")
 endif()
+set(PXREA_SDK_INCLUDE_DIR "${PXREA_SDK_ROOT}/include" CACHE PATH "XRoboToolkit SDK headers")
+if(DEFINED ENV{PXREA_SDK_INCLUDE_DIR} AND NOT "$ENV{PXREA_SDK_INCLUDE_DIR}" STREQUAL "")
+  set(PXREA_SDK_INCLUDE_DIR "$ENV{PXREA_SDK_INCLUDE_DIR}")
+endif()
+set(PXREA_SDK_LIB_DIR "" CACHE PATH "Directory containing libPXREARobotSDK.so")
+if(DEFINED ENV{PXREA_SDK_LIB_DIR} AND NOT "$ENV{PXREA_SDK_LIB_DIR}" STREQUAL "")
+  set(PXREA_SDK_LIB_DIR "$ENV{PXREA_SDK_LIB_DIR}")
+endif()
+
+if(NOT PXREA_SDK_LIB_DIR)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(_pxrea_lib_candidates
+      "${PXREA_SDK_ROOT}/linux_aarch64/64"
+      "${PXREA_SDK_ROOT}/arm64"
+      "${PXREA_SDK_ROOT}/aarch64"
+      "${PXREA_SDK_ROOT}/lib/arm64"
+      "${PXREA_SDK_ROOT}/lib/aarch64")
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+    set(_pxrea_lib_candidates
+      "${PXREA_SDK_ROOT}/x64"
+      "${PXREA_SDK_ROOT}/linux/64")
+  endif()
+  foreach(_candidate IN LISTS _pxrea_lib_candidates)
+    if(EXISTS "${_candidate}/libPXREARobotSDK.so")
+      set(PXREA_SDK_LIB_DIR "${_candidate}")
+      break()
+    endif()
+  endforeach()
+endif()
+
+if(NOT EXISTS "${PXREA_SDK_INCLUDE_DIR}/PXREARobotSDK.h" OR
+   NOT EXISTS "${PXREA_SDK_LIB_DIR}/libPXREARobotSDK.so")
+  message(FATAL_ERROR "XRoboToolkit SDK not found; set PXREA_SDK_INCLUDE_DIR and PXREA_SDK_LIB_DIR to the installed ARM64 paths")
+endif()
+set(PXREA_ROBOT_SDK "${PXREA_SDK_LIB_DIR}/libPXREARobotSDK.so")
+message(STATUS "XRoboToolkit SDK library: ${PXREA_ROBOT_SDK}")
 
 add_executable(differential_ik_real_node src/differential_ik_node.cpp)
 add_executable(pose_target_demo src/pose_target_demo.cpp)
@@ -75,11 +106,11 @@ ament_target_dependencies(xr_pose_demo geometry_msgs rclcpp sensor_msgs)
 ament_target_dependencies(xrobotoolkit_pxrea_adapter_real
   geometry_msgs rclcpp sensor_msgs)
 target_include_directories(xrobotoolkit_pxrea_adapter_real PRIVATE
-  /opt/apps/roboticsservice/SDK/include)
+  "${PXREA_SDK_INCLUDE_DIR}")
 target_link_libraries(xrobotoolkit_pxrea_adapter_real ${PXREA_ROBOT_SDK})
 set_target_properties(xrobotoolkit_pxrea_adapter_real PROPERTIES
-  BUILD_RPATH "/opt/apps/roboticsservice/SDK/x64"
-  INSTALL_RPATH "/opt/apps/roboticsservice/SDK/x64")
+  BUILD_RPATH "${PXREA_SDK_LIB_DIR}"
+  INSTALL_RPATH "${PXREA_SDK_LIB_DIR}")
 
 ament_target_dependencies(o6_trigger_state_node
   rclcpp sensor_msgs std_msgs)

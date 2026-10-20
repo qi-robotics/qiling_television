@@ -1,5 +1,7 @@
 # Qiling 双臂 XR 遥操（`xrtele` 分支）
 
+> Jetson NX（ARM64）部署请先看 [handoff.md](handoff.md)。下文部分 x86_64、Unity Demo 和仿真说明不适用于当前 NX 部署。
+
 本分支用于使用 Meta Quest 3 手柄遥操 Qiling 人形机器人的双臂和 O6 灵巧手，包含：
 
 - XRoboToolkit Quest 3 控制器输入；

@@ -3,6 +3,8 @@ conversion_runs
 install
 lerobot_dataset_all_episodes_v1
 log
+config/cyclonedds_nx.xml
+XRoboToolkit-PC-Service-headless_*_arm64.deb
 qiling_release
 recordings
 /rollout

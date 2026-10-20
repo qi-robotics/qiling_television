@@ -33,6 +33,7 @@
 #include "qiling_kinematics/hierarchical_dik_solver.hpp"
 #include "qiling_kinematics/ik_diagnostics.hpp"
 #include "qiling_kinematics/ik_types.hpp"
+#include "qiling_kinematics/near_limit_guard.hpp"
 
 namespace
 {
@@ -367,6 +368,7 @@ private:
     declare_parameter("joint_limit_damper_gain", 1.0);
     declare_parameter("hard_limit_tolerance_rad", 0.005);
     declare_parameter("active_entry_margin_rad", 0.05);
+    declare_parameter("left_guarded_near_limit_regrip", true);
     declare_parameter("limit_recovery_margin_rad", 0.08);
     declare_parameter("limit_recovery_max_velocity_rps", 0.25);
     declare_parameter("joint_limit_prediction_enabled", true);
@@ -1510,43 +1512,56 @@ private:
     }
 
     // Check the measured state before updateGripRequest can create ACTIVE.
-    // If feedback is still inside the URDF hard range but outside the ACTIVE
-    // safety margin, recover the held reference into the interior at the same
-    // bounded speed used for a hard-limit recovery. Recovery starts only from
-    // an explicit Grip request, so an idle Hold never moves autonomously.
+    // If feedback is inside the URDF hard range but just outside the ACTIVE
+    // safety margin, the left arm can use the same Hold -> Active Grip edge as
+    // the right arm when its held target is already inward. Other cases keep
+    // bounded limit recovery. An idle Hold never starts either path.
     if (requested_active && control.state() == ArmRunState::Hold &&
       !control.releaseRequired() && !insideJointSafetyRange(
         measured, q_min, q_max, active_entry_margin))
     {
-      // Preserve the last published Hold command as the first recovery command
-      // to keep this boundary bumpless. It is clamped only to the URDF hard
-      // range; subsequent cycles move it toward the configured interior zone.
-      const ArmVector initial_reference = clampToJointRange(
-        control.reference(), q_min, q_max);
-      control.enterLimitRecovery(
-        initial_reference, true,
-        "measured position outside ACTIVE safety range; limit recovery");
-      resetTargetAndGuard(side);
-      elbow_geometry_[side].reset();
-      diagnostics.solver_status = SolverStatus::InvalidBounds;
-      diagnostics.min_hard_limit_distance_rad =
-        minJointLimitDistance(measured, q_min, q_max);
-      diagnostics.qdot.setZero();
-      diagnostics.command_held = true;
-      const ArmVector target_reference = limitRecoveryTarget(
-        initial_reference, q_min, q_max, recovery_margin);
-      RCLCPP_WARN(
-        get_logger(),
-        "%s entered LIMIT_RECOVERY before ACTIVE: measured=%s reference=%s "
-        "inward_target=%s safety_margin=%.4f recovery_margin=%.4f "
-        "max_velocity=%.4f urdf_range=[%s, %s]; teleoperation remains disabled",
-        side_name, formatArmVector(measured).c_str(),
-        formatArmVector(initial_reference).c_str(),
-        formatArmVector(target_reference).c_str(), active_entry_margin,
-        recovery_margin, recovery_velocity, formatArmVector(q_min).c_str(),
-        formatArmVector(q_max).c_str());
-      finishArmCycle(side_name, previous_state, control, diagnostics);
-      return;
+      const bool guarded_regrip =
+        side == kLeftSide &&
+        get_parameter("left_guarded_near_limit_regrip").as_bool() &&
+        qiling_kinematics::canResumeNearLimit(
+        measured, control.reference(), q_min, q_max, active_entry_margin,
+        get_parameter("max_reference_tracking_error_rad").as_double());
+      if (guarded_regrip) {
+        RCLCPP_WARN(
+          get_logger(),
+          "%s guarded near-limit Grip re-engagement: feedback is inside URDF bounds "
+          "and the held reference points inward; outward joint velocity is blocked",
+          side_name);
+      } else {
+        // Preserve the last published Hold command as the first recovery
+        // command. Subsequent cycles move it toward the interior zone.
+        const ArmVector initial_reference = clampToJointRange(
+          control.reference(), q_min, q_max);
+        control.enterLimitRecovery(
+          initial_reference, true,
+          "measured position outside ACTIVE safety range; limit recovery");
+        resetTargetAndGuard(side);
+        elbow_geometry_[side].reset();
+        diagnostics.solver_status = SolverStatus::InvalidBounds;
+        diagnostics.min_hard_limit_distance_rad =
+          minJointLimitDistance(measured, q_min, q_max);
+        diagnostics.qdot.setZero();
+        diagnostics.command_held = true;
+        const ArmVector target_reference = limitRecoveryTarget(
+          initial_reference, q_min, q_max, recovery_margin);
+        RCLCPP_WARN(
+          get_logger(),
+          "%s entered LIMIT_RECOVERY before ACTIVE: measured=%s reference=%s "
+          "inward_target=%s safety_margin=%.4f recovery_margin=%.4f "
+          "max_velocity=%.4f urdf_range=[%s, %s]; teleoperation remains disabled",
+          side_name, formatArmVector(measured).c_str(),
+          formatArmVector(initial_reference).c_str(),
+          formatArmVector(target_reference).c_str(), active_entry_margin,
+          recovery_margin, recovery_velocity, formatArmVector(q_min).c_str(),
+          formatArmVector(q_max).c_str());
+        finishArmCycle(side_name, previous_state, control, diagnostics);
+        return;
+      }
     }
 
     control.updateGripRequest(requested_active, measured);
@@ -1676,6 +1691,14 @@ private:
       diagnostics.command_held = true;
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
+    }
+
+    if (side == kLeftSide &&
+      get_parameter("left_guarded_near_limit_regrip").as_bool())
+    {
+      result.qdot = qiling_kinematics::suppressOutwardVelocityNearLimit(
+        measured, result.qdot, q_min, q_max, active_entry_margin);
+      diagnostics.qdot = result.qdot;
     }
 
     const bool guard_enabled = get_parameter("workspace_guard_enabled").as_bool();

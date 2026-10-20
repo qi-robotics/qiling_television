@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "qiling_kinematics/arm_control_state.hpp"
+#include "qiling_kinematics/near_limit_guard.hpp"
 
 namespace
 {
@@ -8,6 +9,76 @@ namespace
 using qiling_kinematics::ArmControlState;
 using qiling_kinematics::ArmRunState;
 using qiling_kinematics::ArmVector;
+using qiling_kinematics::canResumeNearLimit;
+using qiling_kinematics::suppressOutwardVelocityNearLimit;
+
+TEST(NearLimitGuard, GuardedRegripMatchesObservedLeftElbowAndKeepsInwardMotion)
+{
+  ArmVector q_min = ArmVector::Constant(-2.0);
+  ArmVector q_max = ArmVector::Constant(2.0);
+  q_min[3] = -2.007;
+  q_max[3] = 1.57;
+  ArmVector measured = ArmVector::Zero();
+  ArmVector reference = ArmVector::Zero();
+  measured[3] = -1.96479;
+  reference[3] = -1.93325;
+
+  ASSERT_TRUE(canResumeNearLimit(measured, reference, q_min, q_max, 0.05, 0.35));
+  ArmControlState left("left");
+  left.initialize(reference);
+  left.updateGripRequest(true, measured);
+  ASSERT_TRUE(left.active());
+  left.updateGripRequest(false, measured);
+  ASSERT_EQ(left.state(), ArmRunState::Hold);
+  ASSERT_FALSE(left.releaseRequired());
+  EXPECT_TRUE(left.reference().isApprox(reference));
+  ASSERT_TRUE(canResumeNearLimit(
+      measured, left.reference(), q_min, q_max, 0.05, 0.35));
+  left.updateGripRequest(true, measured);
+  EXPECT_EQ(left.state(), ArmRunState::Active);
+  EXPECT_TRUE(left.reference().isApprox(reference));
+
+  ArmVector qdot = ArmVector::Constant(0.1);
+  qdot[3] = -0.2;
+  const ArmVector guarded = suppressOutwardVelocityNearLimit(
+    measured, qdot, q_min, q_max, 0.05);
+  EXPECT_DOUBLE_EQ(guarded[3], 0.0);
+  EXPECT_DOUBLE_EQ(guarded[0], 0.1);
+
+  qdot[3] = 0.2;
+  EXPECT_DOUBLE_EQ(suppressOutwardVelocityNearLimit(
+      measured, qdot, q_min, q_max, 0.05)[3], 0.2);
+}
+
+TEST(NearLimitGuard, RejectsUnsafeReferenceAndHardLimitViolation)
+{
+  const ArmVector q_min = ArmVector::Constant(-2.0);
+  const ArmVector q_max = ArmVector::Constant(2.0);
+  ArmVector measured = ArmVector::Zero();
+  ArmVector reference = ArmVector::Zero();
+  measured[3] = -1.97;
+  reference[3] = -1.97;
+  EXPECT_FALSE(canResumeNearLimit(measured, reference, q_min, q_max, 0.05, 0.35));
+
+  reference[3] = -1.90;
+  measured[3] = -2.001;
+  EXPECT_FALSE(canResumeNearLimit(measured, reference, q_min, q_max, 0.05, 0.35));
+}
+
+TEST(NearLimitGuard, AppliesSymmetricallyAtUpperLimit)
+{
+  const ArmVector q_min = ArmVector::Constant(-2.0);
+  const ArmVector q_max = ArmVector::Constant(2.0);
+  ArmVector measured = ArmVector::Zero();
+  ArmVector reference = ArmVector::Zero();
+  measured[2] = 1.97;
+  reference[2] = 1.90;
+  ASSERT_TRUE(canResumeNearLimit(measured, reference, q_min, q_max, 0.05, 0.35));
+  ArmVector qdot = ArmVector::Constant(0.1);
+  qdot[2] = 0.2;
+  EXPECT_DOUBLE_EQ(suppressOutwardVelocityNearLimit(
+      measured, qdot, q_min, q_max, 0.05)[2], 0.0);
+}
 
 TEST(ArmControlState, HoldNeverIntegrates)
 {

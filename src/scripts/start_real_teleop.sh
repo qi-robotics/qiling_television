@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-DDS_CONFIG="/home/coral/qi_deploy_igh_release/config/dds/cyclonedds_enp8s0.xml"
+DDS_CONFIG="${QILING_DDS_CONFIG:-${ROOT_DIR}/config/cyclonedds_nx.xml}"
 
 if [[ ! -r "$ROOT_DIR/install/setup.bash" ]]; then
   echo "错误：工程尚未编译，请先运行 src/scripts/build_xrtele.sh" >&2
@@ -17,10 +17,23 @@ set -u
 export ROS_DOMAIN_ID=21
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export CYCLONEDDS_URI="file://$DDS_CONFIG"
 
-if [[ ! -r "$DDS_CONFIG" ]]; then
-  echo "错误：无法读取 DDS 配置：$DDS_CONFIG" >&2
+if [[ -z "${CYCLONEDDS_URI:-}" ]]; then
+  if [[ ! -r "$DDS_CONFIG" ]]; then
+    echo "错误：无法读取 NX DDS 配置：$DDS_CONFIG；请从 config/cyclonedds_nx.xml.example 创建配置，或设置 QILING_DDS_CONFIG/CYCLONEDDS_URI。" >&2
+    exit 1
+  fi
+  DDS_CONFIG="$(realpath "$DDS_CONFIG")"
+  export CYCLONEDDS_URI="file://$DDS_CONFIG"
+elif [[ "$CYCLONEDDS_URI" == file://* ]] &&
+     [[ ! -r "${CYCLONEDDS_URI#file://}" ]]; then
+  echo "错误：无法读取 CYCLONEDDS_URI 指定的文件：${CYCLONEDDS_URI#file://}" >&2
+  exit 1
+fi
+
+if [[ "$CYCLONEDDS_URI" == file://* ]] &&
+   grep -q 'REPLACE_WITH_NX_ETHERNET_INTERFACE' "${CYCLONEDDS_URI#file://}"; then
+  echo "错误：DDS 配置中的 NX 网卡名尚未填写。" >&2
   exit 1
 fi
 

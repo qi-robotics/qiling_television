@@ -68,9 +68,13 @@ qiling_differential_ik_real:
     joint_limit_margin_rad: 0.12
     joint_limit_damper_gain: 1.5
     hard_limit_tolerance_rad: 0.005
-    # If ACTIVE is requested while feedback is inside the URDF range but closer
-    # than this margin, enter bounded LIMIT_RECOVERY instead of activating.
+    # If Grip is engaged with feedback closer than this margin to a URDF limit,
+    # enter bounded LIMIT_RECOVERY, except for the guarded left-arm case below.
     active_entry_margin_rad: 0.05
+    # Allow the left arm to re-engage from a near-limit measured pose only
+    # when its held command already points inward and is tracking feedback.
+    # During active motion, block solved velocity toward a nearby limit.
+    left_guarded_near_limit_regrip: true
     # For both near-limit ACTIVE entry and a crossed URDF limit, move the held
     # command reference into this interior zone before allowing teleoperation.
     limit_recovery_margin_rad: 0.08
