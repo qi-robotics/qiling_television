@@ -234,7 +234,7 @@ ros2 launch qiling_kinematics xr_teleop_demo.launch.py
 设置 ROS 网络。默认 Domain ID 为 `16`，需要修改时在启动命令前覆盖：
 
 ```bash
-export ROS_DOMAIN_ID=16
+export ROS_DOMAIN_ID=21
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ```
