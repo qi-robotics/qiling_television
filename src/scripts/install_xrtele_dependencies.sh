@@ -13,24 +13,20 @@ sudo apt-get install -y \
   cmake \
   git \
   libeigen3-dev \
-  libglfw3-dev \
   libsimde-dev \
-  libyaml-cpp-dev \
   pkg-config \
   python3-colcon-common-extensions \
   python3-rosdep \
   python3-yaml \
   ros-humble-ament-cmake \
   ros-humble-ament-cmake-gtest \
-  ros-humble-kdl-parser \
   ros-humble-pinocchio \
   ros-humble-proxsuite \
   ros-humble-rmw-cyclonedds-cpp \
   ros-humble-robot-state-publisher \
   ros-humble-rosidl-default-generators \
   ros-humble-rosidl-generator-dds-idl \
-  ros-humble-tf2-ros \
   ros-humble-urdf
 
-echo "ROS 2、Pinocchio、ProxSuite、MuJoCo GUI 编译依赖和 ADB 已安装。"
+echo "真机遥操编译工具、ROS 2 接口依赖、Pinocchio、ProxSuite、CycloneDDS 和 ADB 已安装。"
 echo "下一步：安装 XRoboToolkit PC Service，再运行 src/scripts/build_xrtele.sh。"

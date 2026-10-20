@@ -22,11 +22,14 @@
 命令输出：
 
 ```text
-/human_lower_command   mit_msgs/msg/MITJointCommands
+/teleop/arms_mit_command   mit_msgs/msg/MITJointCommands
 ```
 
 命令固定为 26 维。0..11 腿部字段使用实测位置，12..18 和 19..25 分别为双臂
 的 MIT 位置/速度/增益/前馈力矩命令。O6 不进入该命令，使用独立接口。
+`xr_teleop_real.launch.py` 中的 `qiling_arms_command_bridge` 将该消息转为
+`/lowcmd_arms` 的 `qi/msg/LowCmd`。SDK 使用自己的上下肢融合器接管双臂；
+策略有效时腿部使用策略输入。遥操不向策略的 `/human_lower_command` 发布。
 
 ## 启动
 
@@ -92,6 +95,7 @@ O6 状态节点在收到该话题为 `true` 之前强制输出零状态，因此
 启动文件包含：
 
 ```text
+qiling_arms_command_bridge       26 维遥操 MIT 命令 → /lowcmd_arms（仅命令转换）
 xrobotoolkit_pxrea_adapter_real  Quest 位姿/按键 → ROS2
 xr_pose_clutch_bridge_real       Grip 离合器与相对位姿目标
 differential_ik_real_node        /human_lower_state → 26 维身体命令
@@ -122,21 +126,17 @@ close: [101, 60, 0, 0, 0, 0]
 speed: 200
 ```
 
-真机还必须单独运行 `topic_convertor`，它负责把 ROS2 的 26 维 MIT 命令转到
-DDS `lowcmd`，并把 DDS `lowstate` 转成 `/human_lower_state`。当前真机默认开启
-双向桥接，因此直接运行即可：
+当前机器已有自启的 `qi_topic_converter`，负责策略命令到 `/lowcmd` 的转换，
+以及 `/lowstate` 到 `/human_lower_state` 的转换。遥操直接订阅其状态输出，
+不要再启动一份默认的双向转换器。
 
-```bash
-ros2 run topic_convertor topic_converter_node
-```
+遥操 launch 内的专用命令桥使用 `expected_motor_count=26`、
+`enable_state_bridge=false`、`enable_command_bridge=true`、
+`strict_command_size=true`，并把输入重映射至 `/teleop/arms_mit_command`、
+输出重映射至 `/lowcmd_arms`。它与自启转换器的命令通道分开。
 
-默认参数为 `expected_motor_count=26`、`enable_state_bridge=true`、
-`enable_command_bridge=true`、`strict_command_size=true`。如需临时关闭命令桥接，
-仍可通过 ROS 参数显式设置 `-p enable_command_bridge:=false`。
-
-该命令要求当前 ROS 环境已经能找到 `qi` 消息包；若 `ros2 run` 找不到
-`topic_convertor` 或构建时找不到 `qiConfig.cmake`，先在机器人上的 DDS/SDK
-工作空间构建并 source 对应工作空间。
+使用 `src/scripts/start_real_teleop.sh` 可自动加载当前机器的 Domain 21、
+CycloneDDS 和 `enp8s0` 配置，并等待现有状态话题后启动上述遥操链路。
 
 ## 左手灵巧手开合测试
 

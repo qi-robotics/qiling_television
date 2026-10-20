@@ -18,7 +18,7 @@
 1. 清空机器人双臂、身体和桌面周围的障碍物；
 2. 确认双臂关节索引、方向和 URDF 与真机一致；
 3. 准备硬件急停，并安排一人随时监护；
-4. 停止其他 `/human_lower_command` 和 `/handscmd` 发布者；
+4. 确认 `/lowcmd_arms` 和 `/handscmd` 没有其他控制发布者；保留自启策略及其转换器；
 5. 先完成 MuJoCo 仿真，再连接真机。
 
 ## 2. 系统要求
@@ -50,7 +50,8 @@ chmod +x src/scripts/*.sh
 ./src/scripts/install_xrtele_dependencies.sh
 ```
 
-该脚本安装编译工具、Pinocchio、ProxSuite、CycloneDDS、MuJoCo GUI 系统依赖和 ADB，
+该脚本安装真机遥操所需的编译工具、ROS 2 接口依赖、Pinocchio、ProxSuite、CycloneDDS 和 ADB，
+不再显式安装 MuJoCo 仿真的 GLFW、yaml-cpp、KDL parser 和 TF2 ROS 依赖，
 但不会安装机器人底层 SDK，也不会安装 XRoboToolkit。
 
 ## 5. 安装 XRoboToolkit PC Service
@@ -139,14 +140,13 @@ adb install -g third_party/xrobotoolkit/quest/XRoboToolkit-Quest-1.0.1.apk
 ./src/scripts/build_xrtele.sh
 ```
 
-该脚本只编译遥操所需包，避免工作区内其他目录影响构建。完成后可检查：
+该脚本只编译 `qiling_kinematics_real` 及其工作区依赖，包括仅用于遥操命令转换的
+`topic_convertor`，不编译仿真和录制包。状态输入复用已自启的转换器。完成后可检查：
 
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 pkg prefix qiling_kinematics
 ros2 pkg prefix qiling_kinematics_real
-ros2 pkg prefix mujoco_simulator
 ```
 
 ## 8. 启动 XRoboToolkit 与 Quest 3
@@ -228,20 +228,37 @@ ros2 launch qiling_kinematics xr_teleop_demo.launch.py
 
 ## 10. 真机遥操
 
-真机 PC 上完成前述依赖、PC Service 和工程编译。机器人底层 SDK 的安装和启动不属于本脚本
-管理范围，必须先由用户按机器人文档启动，并确保它能够发布/接收 Qi DDS 数据。
+真机 PC 上完成前述依赖、PC Service 和工程编译。当前机器的机器人 SDK 和
+`qi_topic_converter` 已由原部署自启，遥操复用其 `/human_lower_state` 状态输出。
 
-设置 ROS 网络。默认 Domain ID 为 `16`，需要修改时在启动命令前覆盖：
+`src/scripts/start_real_teleop.sh` 在加载 ROS 环境后固定设置以下配置。
+启动脚本时无需另外 export；手动运行 ROS 检查命令的终端使用同样的配置：
 
 ```bash
 export ROS_DOMAIN_ID=21
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI=file:///home/coral/qi_deploy_igh_release/config/dds/cyclonedds_enp8s0.xml
 ```
+
+该 XML 已配置 Domain `21`、网卡 `enp8s0`。迁移到其他机器时需要核对该文件路径和网卡。
+
+当前机载 SDK 已实现上下肢融合，参见机载
+`/home/coral/ql_sdk_igh_release/docs/遥操侧接入说明.md`：
+
+- 自启策略保持 `/human_lower_command → qi_topic_converter → /lowcmd`；
+- 遥操 IK 发布 `/teleop/arms_mit_command`，由 launch 中的
+  `qiling_arms_command_bridge` 转为 `/lowcmd_arms`（`qi/msg/LowCmd`）；
+- 专用桥关闭状态转换，不重复发布 `/human_lower_state`；
+- SDK 在策略有效时使用策略腿部和遥操双臂；遥操仍发 26 维包，腿部位置仍填实测值；
+- O6 使用独立 `/handscmd`。
+
+ROS 话题 `/lowcmd_arms` 对应 SDK 文档里的 DDS 话题 `rt/lowcmd_arms`。
+不要把遥操输出改回策略的 `/human_lower_command` 或 `/lowcmd`。
 
 完整顺序：
 
-1. 启动机器人 SDK；
+1. 确认自启 SDK、策略和转换器正常；
 2. 启动 XRoboToolkit PC Service；
 3. Quest 3 连接真机 PC，打开 `Controller Tracking` 和 `Send`；
 4. 清空双臂周围环境并准备急停；
@@ -254,9 +271,9 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 脚本会按顺序执行：
 
 ```text
-topic_convertor
-  → 等待 /human_lower_state
+等待现有 qi_topic_converter 发布 /human_lower_state
   → qiling_kinematics_real
+    （启动仅命令转换的 qiling_arms_command_bridge，输出 /lowcmd_arms）
   → 当前实测姿态
   → 安全过渡点
   → home
@@ -269,7 +286,11 @@ topic_convertor
 QILING_STATE_WAIT_SEC=60 ./src/scripts/start_real_teleop.sh
 ```
 
-按 `Ctrl+C` 会停止真机遥操和 `topic_convertor`，不会命令机器人回到全零位。
+按 `Ctrl+C` 会停止本次真机遥操；已自启的 SDK 和转换器由原服务管理。
+退出不会命令机器人回到全零位。
+按机载 SDK 文档，遥操停发超过 `aux_stale` 后，双臂会平滑返回策略臂姿；
+当前磁盘配置的 `aux_stale` 和 `arm_transition` 均为 1000 ms，实际行为以 SDK
+启动时加载的配置为准。
 
 ## 11. 手柄控制
 
@@ -299,7 +320,8 @@ ros2 topic echo /xr/controller_joy --once
 
 ```bash
 ros2 topic hz /human_lower_state
-ros2 topic info -v /human_lower_command
+ros2 topic hz /teleop/arms_mit_command
+ros2 topic info -v /lowcmd_arms
 ros2 topic info -v /handscmd
 ```
 

@@ -21,15 +21,7 @@ cd "$ROOT_DIR"
 colcon build \
   --base-paths "$ROOT_DIR/src" \
   --symlink-install \
-  --packages-select \
-    communicate_interface \
-    mit_msgs \
-    qi \
-    qi_robot_description \
-    mujoco_simulator \
-    qiling_kinematics \
-    qiling_kinematics_real \
-    topic_convertor \
+  --packages-up-to qiling_kinematics_real \
   --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 
 echo "编译完成。新终端中请 source：$ROOT_DIR/install/setup.bash"

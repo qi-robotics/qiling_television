@@ -22,6 +22,7 @@
   <depend>proxsuite</depend>
   <depend>qi</depend>
   <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>topic_convertor</exec_depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

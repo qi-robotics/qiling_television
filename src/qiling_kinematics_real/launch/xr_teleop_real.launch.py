@@ -12,6 +12,25 @@ def generate_launch_description():
     pxrea_config = package_share / "config" / "xrobotoolkit_pxrea_adapter.yaml"
 
     return LaunchDescription([
+        # Reuse the existing /human_lower_state publisher. This bridge only
+        # converts teleoperation commands for the SDK's auxiliary arm input.
+        # The SDK combines policy legs with auxiliary arms using full-body indices.
+        Node(
+            package="topic_convertor",
+            executable="topic_converter_node",
+            name="qiling_arms_command_bridge",
+            output="screen",
+            parameters=[{
+                "expected_motor_count": 26,
+                "enable_state_bridge": False,
+                "enable_command_bridge": True,
+                "strict_command_size": True,
+            }],
+            remappings=[
+                ("/human_lower_command", "/teleop/arms_mit_command"),
+                ("/lowcmd", "/lowcmd_arms"),
+            ],
+        ),
         Node(
             package="qiling_kinematics_real",
             executable="differential_ik_real_node",
