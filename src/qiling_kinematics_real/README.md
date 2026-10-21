@@ -1,6 +1,6 @@
 # qiling_kinematics_real
 
-真机专用双臂末端位姿遥操包。该包与 MuJoCo 仿真包独立，使用固定
+Jetson NX 真机专用双臂末端位姿遥操包。使用固定
 `base_link` 的 `s4_dual_arm.urdf`，通过 Pinocchio + ProxSuite 执行双臂
 层级差分 IK。
 
@@ -33,14 +33,14 @@
 
 ## 启动
 
-先启动 XRoboToolkit PC Service 和 Quest 端数据发送，再加载 ROS2 环境：
+在项目根目录启动 PC Service 和 Quest 端数据发送。正式 NX 部署使用项目脚本；真机脚本自行加载 ROS 2/工作区环境，设置 Domain 21 和 CycloneDDS，并等待状态输入：
 
 ```bash
-source /opt/ros/humble/setup.bash
-source install/setup.bash
+./src/scripts/start_xrobotoolkit_real.sh
+./src/scripts/start_real_teleop.sh
 ```
 
-启动真机遥操链路：
+下面的直接 launch 命令用于已自行准备好 ROS 和 DDS 环境的开发终端，正式部署优先使用上面的脚本：
 
 ```bash
 ros2 launch qiling_kinematics_real xr_teleop_real.launch.py
@@ -103,7 +103,7 @@ o6_trigger_state_node             Trigger → 独立 O6 状态位
 o6_command_adapter_node           O6 状态位 → /handscmd
 ```
 
-O6 内部状态话题暂定为：
+O6 内部状态话题为：
 
 ```text
 /teleop/o6_trigger_state   std_msgs/msg/UInt8
@@ -135,8 +135,9 @@ speed: 200
 `strict_command_size=true`，并把输入重映射至 `/teleop/arms_mit_command`、
 输出重映射至 `/lowcmd_arms`。它与自启转换器的命令通道分开。
 
-使用 `src/scripts/start_real_teleop.sh` 可自动加载当前机器的 Domain 21、
-CycloneDDS 和 `enp8s0` 配置，并等待现有状态话题后启动上述遥操链路。
+`src/scripts/start_real_teleop.sh` 默认加载项目的 `config/cyclonedds_nx.xml`，
+当前 NX 本地文件绑定与板子直连的 `eth2`。它自行设置 Domain 21、
+CycloneDDS RMW 并等待现有状态话题；启动前无需在终端手动 source/export。
 
 ## 左手灵巧手开合测试
 

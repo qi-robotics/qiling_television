@@ -5,8 +5,8 @@
 - 机器人板子与 Jetson NX 通过网线连接；机器人板子上的机器人 SDK 和 `qi_topic_converter` 已自启，ROS Domain ID 为 `21`。
 - NX 已安装 ROS 2 Humble，Domain ID 也设为 `21`。本次把 XRoboToolkit PC Service 和双臂遥操程序部署到 NX；不部署仿真、数据采集或记录功能，也不在 NX 上运行腿部控制器。
 - 2026-10-20 已在 NX 核实：`aarch64`、Ubuntu 22.04.5、ROS Domain 21；机器人 ROS 话题在 `eth2`（`192.168.123.100/24`）上可发现。已安装 XRoboToolkit ARM64 headless 包及编译依赖，本机 5 个包均构建成功。
-- 下载的 headless `.deb` 为 `arm64`，SHA256 与下文预期值一致。SDK 实际路径为 `/opt/apps/roboticsservice/SDK/arm64/libPXREARobotSDK.so`；服务程序和 SDK 库均为 aarch64。已读取 `/human_lower_state` 的一帧完整 26 电机有限位置值，持续频率约 1 kHz；`/lowcmd_arms` 和 `/handscmd` 均有一个裸 DDS 订阅者、没有发布者。
-- XR 适配器已连接 PC Service，Quest 左右控制器位姿均约 90.9 Hz，`/xr/controller_joy` 可读。已读取的一帧 Joy 按键、轴均为零，尚未通过实际按键验证 Grip/Trigger 索引。完整遥操链路尚未验收，也未启动真机控制节点或发布控制命令。
+- 下载的 headless `.deb` 为 `arm64`，SHA256 与下文预期值一致。SDK 实际路径为 `/opt/apps/roboticsservice/SDK/arm64/libPXREARobotSDK.so`；服务程序和 SDK 库均为 aarch64。已读取 `/human_lower_state` 的一帧完整 26 电机有限位置值，持续频率约 1 kHz；初次只读验收时，`/lowcmd_arms` 和 `/handscmd` 均有一个裸 DDS 订阅者、没有发布者。运行遥操后 NX 会向这两个话题发布命令。
+- XR 适配器已连接 PC Service，Quest 左右控制器位姿均约 90.9 Hz，`/xr/controller_joy` 可读。此后用户已完成真机测试，确认当前双臂和手部遥操正常。左臂松开 Grip 后再次握紧受近限位恢复阻塞的问题已在项目中修复并通过现场测试；配置项为 `left_guarded_near_limit_regrip`。
 
 ## 两台机器分别运行什么
 
@@ -31,7 +31,7 @@ NX：手部命令 → /handscmd → 机器人板子：SDK
 
 NX 是 ARM64 机器时，优先使用官方 [`XRoboToolkit-PC-Service-headless_1.0.0.0_arm64.deb`](https://github.com/XR-Robotics/XRoboToolkit-PC-Service/releases/download/v1.0.0/XRoboToolkit-PC-Service-headless_1.0.0.0_arm64.deb)。本项目只需要 PC Service 和 SDK，不需要 PC 端 2D/3D 图形演示。需要图形演示时再考虑完整的 [`XRoboToolkit-PC-Service_1.0.0.0_arm64.deb`](https://github.com/XR-Robotics/XRoboToolkit-PC-Service/releases/download/v1.0.0/XRoboToolkit-PC-Service_1.0.0.0_arm64.deb)。Windows 包以及当前板子上的 AMD64 包都不适用于 NX。
 
-官方项目说明支持 Linux ARM64，并将 `runService.sh` 列为单独启动服务的入口：[项目说明](https://github.com/XR-Robotics/XRoboToolkit-PC-Service/blob/main/README-CN.md)。官方仓库有一条关于 headless 包运行 **2D 图形 Demo** 时缺少 QML 库的[问题报告](https://github.com/XR-Robotics/XRoboToolkit-PC-Service/issues/13)；这不能代替对服务和 SDK 的实测。包的具体文件布局尚未在 NX 上核实，以下路径必须以安装结果为准。
+官方项目说明支持 Linux ARM64，并将 `runService.sh` 列为单独启动服务的入口：[项目说明](https://github.com/XR-Robotics/XRoboToolkit-PC-Service/blob/main/README-CN.md)。当前 NX 已核实 headless 服务和 SDK 的安装位置；换机或换包时仍须按安装结果核对。
 
 在 NX 上先检查环境和下载包：
 
@@ -61,20 +61,20 @@ LD_LIBRARY_PATH="/opt/apps/roboticsservice:/opt/apps/roboticsservice/lib:/opt/ap
 1. NX 当前 `eth2=192.168.123.100/24`、`eth3=192.168.1.102/24`、`wlan0=192.168.110.84/24`。只绑定 `eth2` 的 CycloneDDS 已发现 `/lowstate`、`/human_lower_state`、`/lowcmd_arms`、`/handscmd`；只绑定 `eth3` 时未发现这些话题。因此本次机器人 ROS 链路使用 **NX 的 `eth2`**。若现场地址或接线改变，应重新核对。
 2. 原交接资料记录板子的 DDS 文件为 `/home/coral/qi_deploy_igh_release/config/dds/cyclonedds_enp8s0.xml`；本次没有读取板子当前实际加载的文件。NX 的 `eth2` 已发现相关话题，因此当前无需为发现问题改动板子 DDS。不要按板子 XML 文件名猜测 NX 的网口。
 3. 已创建 NX 本地 `config/cyclonedds_nx.xml` 并绑定 `eth2`，该机器配置被 Git 忽略；可提交的模板是 `config/cyclonedds_nx.xml.example`。`start_real_teleop.sh` 默认读取本地文件，也支持 `QILING_DDS_CONFIG` 或现有 `CYCLONEDDS_URI` 覆盖。遥操进程固定使用 Domain 21、`ROS_LOCALHOST_ONLY=0` 和 CycloneDDS RMW。[网卡配置说明](https://cyclonedds.io/docs/cyclonedds/latest/config/network_interfaces.html)
-4. 头显到 NX 的 PC Service 路径仍未实测。若头显走 Wi-Fi，当前 NX 的 `wlan0` 为 `192.168.110.84/24`；应在头显侧核实这个地址可达，不要填机器人有线网段地址。
+4. 用户已完成 Quest 到 NX 的 PC Service 连接和真机遥操测试。网络模式或地址改变时，在头显中填写当前可达的 NX 地址，不要根据机器人有线网段猜测。
 
 同为 Domain 21 只是必要条件，不能替代网卡和跨机器发现检查。
 
 ## 已完成的仓库适配
 
-以下文件已修改，但 SDK 实际安装布局与运行表现仍须在安装后验证：
+以下为 NX 适配文件和当前运行结果：
 
-| 文件 | 已完成的适配 | 后续核实 |
+| 文件 | 已完成的适配 | 当前结果或注意事项 |
 | --- | --- | --- |
-| [`src/scripts/build_xrtele.sh`](src/scripts/build_xrtele.sh) | 按架构查找 SDK 库，支持显式路径覆盖；SDK 路径通过环境变量传给真机包，避免向其余包传入无关 CMake 参数。 | 安装路径已核实；脚本这一小改动尚未重新构建验证。 |
-| [`src/qiling_kinematics_real/CMakeLists.txt`](src/qiling_kinematics_real/CMakeLists.txt) | 使用找到的 SDK 库路径链接并设置 RPATH。 | NX 编译和运行时动态库加载。 |
-| [`src/scripts/start_xrobotoolkit_real.sh`](src/scripts/start_xrobotoolkit_real.sh)、[`stop_xrobotoolkit_real.sh`](src/scripts/stop_xrobotoolkit_real.sh) | 通过厂商 `runService.sh` 启动服务，不再要求 x86 Unity Demo；只停止本脚本记录的服务进程。 | headless 包的启动脚本和进程行为。 |
-| [`src/scripts/start_real_teleop.sh`](src/scripts/start_real_teleop.sh) | 默认读取 NX DDS 文件并允许覆盖；保留 Domain 21 和状态等待。 | 正式遥操前再核对现场网卡。 |
+| [`src/scripts/build_xrtele.sh`](src/scripts/build_xrtele.sh) | 按架构查找 SDK 库，支持显式路径覆盖；SDK 路径通过环境变量传给真机包，避免向其余包传入无关 CMake 参数。 | NX 已完成构建。 |
+| [`src/qiling_kinematics_real/CMakeLists.txt`](src/qiling_kinematics_real/CMakeLists.txt) | 使用找到的 SDK 库路径链接并设置 RPATH。 | NX 已编译并完成真机遥操测试。 |
+| [`src/scripts/start_xrobotoolkit_real.sh`](src/scripts/start_xrobotoolkit_real.sh)、[`stop_xrobotoolkit_real.sh`](src/scripts/stop_xrobotoolkit_real.sh) | 通过厂商 `runService.sh` 启动服务，不再要求 x86 Unity Demo；只停止本脚本记录的服务进程。 | NX 的 PC Service 已用于真机遥操测试。 |
+| [`src/scripts/start_real_teleop.sh`](src/scripts/start_real_teleop.sh) | 自行 source ROS 2/工作区环境，设置 Domain 21、CycloneDDS，并默认读取 NX DDS 文件。 | 用户已完成真机遥操测试；网卡变化时重查 DDS 文件。 |
 | [`src/scripts/install_xrtele_dependencies.sh`](src/scripts/install_xrtele_dependencies.sh) | Ubuntu 22.04 ARM64 依赖已安装。 | 首次本机构建已成功；Pinocchio 引出的 Boost `python310` 提示为非致命 CMake 警告。 |
 
 不要把板子现有的 `build/`、`install/` 目录或 AMD64 `.deb` 当成 NX 的可执行产物；在 NX 上从源码构建。此仓库的仿真包已删除，不需要为 NX 安装 MuJoCo GUI 依赖。
@@ -85,7 +85,7 @@ LD_LIBRARY_PATH="/opt/apps/roboticsservice:/opt/apps/roboticsservice/lib:/opt/ap
 2. **确认两条网络**：验证 NX ↔ 板子的 IP 连通；确认板子现有 CycloneDDS 接口覆盖 NX 的连接路径，并配置 NX 的 DDS 网卡；确认头显能访问 NX 的 PC Service IP。
 3. **安装依赖并在 NX 编译**：已执行安装和 `./src/scripts/build_xrtele.sh`；5 个包全部成功。不要沿用板子上的 x86 编译结果。
 4. **先验证 ROS 状态**：已在 NX 收到一帧 `/human_lower_state`，`joint_states.position` 恰好有 26 个有限数值；`ros2 topic hz` 测得持续频率约 1 kHz。
-5. **验证头显链路**：headless PC Service 和独立 PXREA 适配器已连通，左右控制器位姿各约 90.9 Hz。仍需在只运行适配器时分别按左右 Grip/Trigger，核对 `/xr/controller_joy` 的按钮和轴索引；测试时不要运行 IK、手部适配器或真机完整 launch。
-6. **验证命令接收再遥操**：只读检查已发现 `/lowcmd_arms` 和 `/handscmd` 各有一个裸 DDS 订阅者、没有发布者；板子 SDK 所属关系仍应与现场配置确认。最后才启动 NX 上的 `start_real_teleop.sh`。该脚本收到 `/human_lower_state` 后会自动开始“当前姿态 → 过渡点 → home → 遥操”，应在双臂周围无障碍物、急停可用时进行。此轮未执行这一步，也未发布控制命令。
+5. **验证头显链路**：headless PC Service 和 PXREA 适配器已连通，左右控制器位姿各约 90.9 Hz；用户后续已完成实际 Grip/Trigger 遥操测试。
+6. **真机遥操**：用户已验证当前双臂与手部控制正常。日常启动按根目录 README 分别执行 `start_xrobotoolkit_real.sh` 和 `start_real_teleop.sh`；两个脚本无需在终端预先手动 source/export。后者收到 `/human_lower_state` 后会自动开始“当前姿态 → 过渡点 → home → 遥操”，启动前仍需确认双臂周围无障碍物、急停可用。
 
 本交接不要求修改机器人腿部控制流程；也不要额外启动一份默认的 `qi_topic_converter`。如果某一步失败，记录 NX 系统版本、网卡/IP、ARM64 SDK 实际路径、DDS XML、相关进程日志和上述话题的发布/订阅情况，再定位该步。
