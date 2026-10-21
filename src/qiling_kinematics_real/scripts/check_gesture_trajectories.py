@@ -159,7 +159,8 @@ def parse_start(values, home):
 
 def validate_action(name, spec, start, home, order, mapping, model, geom,
                     lower, upper, velocity, acceleration, margin, factor):
-    target = {side: vector(spec.get(f"{side}_target", start[side]), 7,
+    target = {side: vector(home[side] if name == "home" else
+                           spec.get(f"{side}_target", start[side]), 7,
                            f"{name} {side} target") for side in SIDES}
     segments = (("entry", start, target),
                 ("motion", target, target),
@@ -183,10 +184,12 @@ def validate_action(name, spec, start, home, order, mapping, model, geom,
                 clearance = np.minimum(values - lower[side], upper[side] - values)
                 smallest = float(np.min(clearance))
                 min_clearance = min(min_clearance, smallest)
-                if smallest < margin - 1e-9:
+                required_clearance = 0.0 if name == "home" and kind == "entry" else margin
+                if smallest < required_clearance - 1e-9:
                     joint = order[int(np.argmin(clearance))]
                     raise ValueError(f"{name} {kind} t={total_time + frame * STEP:.2f}s: "
-                                     f"{side} {joint} limit clearance {smallest:.4f} < {margin:.4f}")
+                                     f"{side} {joint} limit clearance {smallest:.4f} < "
+                                     f"{required_clearance:.4f}")
                 speed = float(np.max(np.abs(dq_ds[side]) / duration / velocity))
                 accel = float(np.max(np.abs(ddq_ds2[side]) / duration**2 / acceleration))
                 peak_speed = max(peak_speed, speed)
@@ -216,7 +219,7 @@ def validate_action(name, spec, start, home, order, mapping, model, geom,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--action", choices=("wave", "shake", "baoquan"))
+    parser.add_argument("--action", choices=("wave", "shake", "baoquan", "home"))
     parser.add_argument("--motor-positions", help="26 comma-separated read-only motor positions; default: configured home")
     args = parser.parse_args()
     settings = yaml.safe_load(GESTURES.read_text())

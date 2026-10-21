@@ -10,7 +10,7 @@
 namespace qiling_kinematics
 {
 
-enum class GestureKind {Wave, Shake, Baoquan};
+enum class GestureKind {Wave, Shake, Baoquan, Home};
 enum class GesturePhase {Entry, GripWait, Motion, ReturnHome, Complete};
 
 const char * gestureName(GestureKind kind);

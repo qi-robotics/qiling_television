@@ -140,8 +140,10 @@ private:
     const GestureStatus next = raw <= static_cast<std::uint8_t>(GestureStatus::Preflight) ?
       static_cast<GestureStatus>(raw) : GestureStatus::Fault;
     if (next == gesture_status_) {
+      repeatBaoquanHandCommand(next);
       return;
     }
+    pending_baoquan_repeats_ = 0;
     const GestureStatus previous = gesture_status_;
     gesture_status_ = next;
     if (next == GestureStatus::Idle) {
@@ -159,9 +161,39 @@ private:
       publishPositions(open_position_, gesture_shake_right_position_, "gesture shake grip");
     } else if (next == GestureStatus::BaoquanPose) {
       publishPositions(open_position_, gesture_baoquan_right_position_, "gesture baoquan pose");
+      scheduleBaoquanHandRepeats(next);
+    } else if (next == GestureStatus::ReturnOpen && previous == GestureStatus::BaoquanPose) {
+      publishPositions(open_position_, open_position_, "gesture baoquan hands open");
+      scheduleBaoquanHandRepeats(next);
     } else {
       publishPositions(open_position_, open_position_, "gesture hands open");
     }
+  }
+
+  void scheduleBaoquanHandRepeats(GestureStatus status)
+  {
+    pending_baoquan_repeat_status_ = status;
+    pending_baoquan_repeats_ = 2;
+    next_baoquan_repeat_at_ =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  }
+
+  void repeatBaoquanHandCommand(GestureStatus status)
+  {
+    if (pending_baoquan_repeats_ == 0 || status != pending_baoquan_repeat_status_ ||
+      std::chrono::steady_clock::now() < next_baoquan_repeat_at_)
+    {
+      return;
+    }
+    if (status == GestureStatus::BaoquanPose) {
+      publishPositions(
+        open_position_, gesture_baoquan_right_position_, "gesture baoquan pose retry");
+    } else {
+      publishPositions(open_position_, open_position_, "gesture baoquan hands open retry");
+    }
+    --pending_baoquan_repeats_;
+    next_baoquan_repeat_at_ =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   }
 
   void onTriggerState(std::uint8_t raw_state)
@@ -250,6 +282,9 @@ private:
   bool trigger_release_ready_{false};
   bool gesture_status_received_{false};
   GestureStatus gesture_status_{GestureStatus::Idle};
+  GestureStatus pending_baoquan_repeat_status_{GestureStatus::Idle};
+  int pending_baoquan_repeats_{0};
+  std::chrono::steady_clock::time_point next_baoquan_repeat_at_{};
   std::chrono::steady_clock::time_point last_gesture_status_time_{};
   std::uint8_t last_state_{0};
   rclcpp::Publisher<qi::msg::HandsCmd>::SharedPtr command_pub_;

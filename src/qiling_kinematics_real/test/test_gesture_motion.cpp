@@ -76,6 +76,29 @@ TEST(GestureMotion, RejectsStartingOutsideSafetyMargin)
   EXPECT_THROW(loadPlan(GestureKind::Wave, unsafe), std::runtime_error);
 }
 
+TEST(GestureMotion, HomeMovesInwardFromNearRightElbowLimit)
+{
+  Arms start = home();
+  start[1][3] = -1.91304;  // Held command from the NX limit-margin rejection log.
+  const auto plan = loadPlan(GestureKind::Home, start);
+  const auto durations = plan.segmentDurations();
+  EXPECT_GE(durations[0], 3.0);
+  EXPECT_NEAR(plan.sample(0.0).position[1][3], -1.91304, 1e-9);
+  EXPECT_NEAR(plan.sample(plan.totalDuration()).position[1][3], home()[1][3], 1e-9);
+  for (double time = 0.0; time <= durations[0]; time += 0.02) {
+    const double elbow = plan.sample(time).position[1][3];
+    EXPECT_GE(elbow, -1.91304 - 1e-9);
+    EXPECT_LE(elbow, home()[1][3] + 1e-9);
+  }
+}
+
+TEST(GestureMotion, HomeRejectsStartOutsideUrdfHardLimit)
+{
+  Arms start = home();
+  start[1][3] = -2.10;
+  EXPECT_THROW(loadPlan(GestureKind::Home, start), std::runtime_error);
+}
+
 TEST(GestureMotion, WaveHasCollisionFreeModelPreflightAtConfiguredHome)
 {
   const auto plan = loadPlan(GestureKind::Wave, home());

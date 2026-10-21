@@ -1943,6 +1943,8 @@ private:
       kind = GestureKind::Shake;
     } else if (buttons == 0x09) { // X + B
       kind = GestureKind::Baoquan;
+    } else if (buttons == 0x06) { // Y + A
+      kind = GestureKind::Home;
     }
     if (!kind) {
       gesture_chord_candidate_ = 0;
@@ -2005,6 +2007,15 @@ private:
       return false;
     }
     for (int side = 0; side < kSideCount; ++side) {
+      if (kind == GestureKind::Home &&
+        outsideJointRange(measured[side], q_min_[side], q_max_[side]))
+      {
+        RCLCPP_WARN(
+          get_logger(), "home chord rejected: %s arm feedback outside URDF limits",
+          side == kLeftSide ? "left" : "right");
+        gesture_plan_.reset();
+        return false;
+      }
       const double tracking_error = (measured[side] - start[side]).cwiseAbs().maxCoeff();
       if (tracking_error >
         get_parameter("gesture_start_tracking_tolerance_rad").as_double())
@@ -2034,7 +2045,8 @@ private:
     gesture_phase_time_sec_ = 0.0;
     gesture_settle_accum_sec_ = 0.0;
     gesture_run_phase_ = GestureRunPhase::Running;
-    gesture_hand_status_ = kind == GestureKind::Wave ? GestureStatus::Wave :
+    gesture_hand_status_ = kind == GestureKind::Home ? GestureStatus::ReturnOpen :
+      kind == GestureKind::Wave ? GestureStatus::Wave :
       kind == GestureKind::Baoquan ? GestureStatus::BaoquanPose : GestureStatus::ShakeOpen;
     publishGestureStatus();
     RCLCPP_INFO(
@@ -2089,6 +2101,8 @@ private:
       gesture_command_q_ = frame.position;
       gesture_command_qdot_ = frame.velocity;
       if (frame.phase == GesturePhase::ReturnHome || frame.phase == GesturePhase::Complete) {
+        gesture_hand_status_ = GestureStatus::ReturnOpen;
+      } else if (gesture_plan_->kind() == GestureKind::Home) {
         gesture_hand_status_ = GestureStatus::ReturnOpen;
       } else if (gesture_plan_->kind() == GestureKind::Wave) {
         gesture_hand_status_ = GestureStatus::Wave;

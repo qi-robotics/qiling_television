@@ -96,9 +96,11 @@ O6 状态节点在收到该话题为 `true` 之前强制输出零状态，因此
 
 已接入挥手、握手、抱拳的关节空间动作状态机，
 `config/differential_ik.yaml` 中 `gesture_enabled: true`；启动并完成 home 后
-无需再手动设置参数。动作分别使用 X+A、Y+B、X+B，需两侧 Grip/Trigger
+无需再手动设置参数。挥手、握手、抱拳分别使用 X+A、Y+B、X+B；
+Y+A 使双臂从当前命令构型平滑回 home。组合键均需两侧 Grip/Trigger
 松开；执行期间两侧遥操和 Trigger 手型输入均锁定。动作从当前命令平滑进场，
-结束后直接回 home，到位并交接后才重新接受控制。离线轨迹与碰撞检查范围
+结束后直接回 home，到位并交接后才重新接受控制。抱拳右手闭合与回程张开
+各发送三次，后两次间隔约 0.1 秒。离线轨迹与碰撞检查范围
 见 [第一阶段说明](docs/gesture_stage1_offline.md)，状态机、手型仲裁及启用前提见
 [第二阶段说明](docs/gesture_stage2_integration.md)。
 

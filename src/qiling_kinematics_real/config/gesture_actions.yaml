@@ -1,6 +1,6 @@
 # Offline gesture candidates. The seventh-dimensional order is the arm motor
 # order 12..18 (left) / 19..25 (right), matching dual_arm_kinematics.cpp.
-# This file is not loaded by the real teleoperation launch.
+# The real IK node loads this file when a gesture or home chord is accepted.
 joint_order:
   - shoulder_pitch
   - shoulder_roll
@@ -13,6 +13,11 @@ motor_offsets: {left: 12, right: 19}
 minimum_limit_clearance_rad: 0.12
 duration_safety_factor: 1.05
 actions:
+  home:
+    entry_min_sec: 3.0
+    motion_min_sec: 0.02
+    return_min_sec: 0.02
+    motion_cycles: 1.0
   wave:
     right_target: [-2.70, -0.50, 1.30, -1.20, 0.30, 0.0, 0.0]
     entry_min_sec: 3.0

@@ -95,6 +95,7 @@ const char * gestureName(GestureKind kind)
     case GestureKind::Wave: return "wave";
     case GestureKind::Shake: return "shake";
     case GestureKind::Baoquan: return "baoquan";
+    case GestureKind::Home: return "home";
   }
   return "unknown";
 }
@@ -132,6 +133,10 @@ GesturePlan GesturePlan::load(
   plan.start_ = start;
   plan.target_ = start;
   plan.home_ = home;
+  if (kind == GestureKind::Home) {
+    // A home chord moves directly from the last published arm command to home.
+    plan.target_ = home;
+  }
   plan.lower_ = lower;
   plan.upper_ = upper;
   plan.speed_limit_ = speed_limit;
@@ -291,8 +296,14 @@ void GesturePlan::validate() const
       }
       for (int joint = 0; joint < kSingleArmDof; ++joint) {
         const double value = frame.position[side][joint];
-        if (value < lower_[side][joint] + margin_ - 1e-9 ||
-          value > upper_[side][joint] - margin_ + 1e-9 ||
+        // Home may start inside the configured soft clearance. Its quintic
+        // entry moves monotonically from that in-range start toward a home
+        // position inside the clearance, so enforce the URDF hard range until
+        // the entry has reached home. All other phases/actions retain margin_.
+        const double clearance =
+          kind_ == GestureKind::Home && frame.phase == GesturePhase::Entry ? 0.0 : margin_;
+        if (value < lower_[side][joint] + clearance - 1e-9 ||
+          value > upper_[side][joint] - clearance + 1e-9 ||
           std::abs(frame.velocity[side][joint]) > speed_limit_[joint] + 1e-9 ||
           std::abs(frame.acceleration[side][joint]) > acceleration_limit_[joint] + 1e-9)
         {
