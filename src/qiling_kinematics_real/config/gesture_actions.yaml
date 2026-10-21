@@ -1,0 +1,51 @@
+# Offline gesture candidates. The seventh-dimensional order is the arm motor
+# order 12..18 (left) / 19..25 (right), matching dual_arm_kinematics.cpp.
+# This file is not loaded by the real teleoperation launch.
+joint_order:
+  - shoulder_pitch
+  - shoulder_roll
+  - shoulder_yaw
+  - elbow
+  - wrist_roll
+  - wrist_pitch
+  - wrist_yaw
+motor_offsets: {left: 12, right: 19}
+minimum_limit_clearance_rad: 0.12
+duration_safety_factor: 1.05
+actions:
+  wave:
+    right_target: [-2.70, -0.50, 1.30, -1.20, 0.30, 0.0, 0.0]
+    entry_min_sec: 3.0
+    motion_min_sec: 3.0
+    return_min_sec: 3.0
+    motion_cycles: 3.0
+    right_oscillation:
+      shoulder_pitch: [[0.03, 0.0]]
+      shoulder_yaw: [[0.20, 0.0]]
+      elbow: [[0.20, 0.0], [0.10, 0.5235987755982988]]
+  shake:
+    right_target: [-0.50, -0.10, 0.50, -0.80, 0.0, 0.0, 0.0]
+    entry_min_sec: 2.0
+    motion_min_sec: 2.0
+    return_min_sec: 2.0
+    motion_cycles: 3.6
+    grip_wait_sec: 1.0
+    right_oscillation:
+      shoulder_pitch: [[0.05, 0.0]]
+      shoulder_yaw: [[0.05, 0.7853981633974483]]
+      elbow: [[0.10, 0.0]]
+  baoquan:
+    left_target: [-0.90, 0.40, -0.75, -1.87, 0.10, 0.0, 0.0]
+    right_target: [-0.90, -0.35, 0.85, -1.87, -0.20, 0.0, 0.0]
+    entry_min_sec: 2.6
+    motion_min_sec: 2.5
+    return_min_sec: 2.3
+    motion_cycles: 2.25
+    left_oscillation:
+      shoulder_pitch: [[0.04, 0.0]]
+      shoulder_yaw: [[-0.06, 1.5707963267948966]]
+      elbow: [[0.008, 0.0]]
+    right_oscillation:
+      shoulder_pitch: [[0.04, 0.0]]
+      shoulder_yaw: [[0.06, 1.5707963267948966]]
+      elbow: [[0.008, 0.0]]

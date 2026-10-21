@@ -19,11 +19,13 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 add_library(qiling_dik_real_core
   src/arm_control_state.cpp
   src/anthropomorphic_elbow.cpp
   src/dual_arm_kinematics.cpp
+  src/gesture_motion.cpp
   src/hierarchical_dik_solver.cpp
 )
 
@@ -36,6 +38,7 @@ target_link_libraries(qiling_dik_real_core PUBLIC
   Eigen3::Eigen
   pinocchio::pinocchio
   proxsuite::proxsuite
+  yaml-cpp
 )
 target_compile_features(qiling_dik_real_core PUBLIC cxx_std_17)
 
@@ -100,6 +103,7 @@ target_link_libraries(pose_target_demo Eigen3::Eigen pinocchio::pinocchio)
 ament_target_dependencies(xr_pose_clutch_bridge_real
   geometry_msgs rclcpp sensor_msgs std_msgs)
 target_link_libraries(xr_pose_clutch_bridge_real Eigen3::Eigen)
+target_include_directories(xr_pose_clutch_bridge_real PRIVATE include)
 
 ament_target_dependencies(xr_pose_demo geometry_msgs rclcpp sensor_msgs)
 
@@ -118,6 +122,7 @@ target_compile_features(o6_trigger_state_node PUBLIC cxx_std_17)
 
 ament_target_dependencies(o6_command_adapter_node
   qi rclcpp std_msgs)
+target_include_directories(o6_command_adapter_node PRIVATE include)
 target_compile_features(o6_command_adapter_node PUBLIC cxx_std_17)
 
 ament_target_dependencies(left_hand_test_node
@@ -181,6 +186,9 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_position_primary_kinematics ament_index_cpp)
   target_link_libraries(test_position_primary_kinematics qiling_dik_real_core)
 
+  ament_add_gtest(test_gesture_motion test/test_gesture_motion.cpp)
+  target_link_libraries(test_gesture_motion qiling_dik_real_core)
+
   ament_add_gtest(test_pose_hierarchy_kinematics test/test_pose_hierarchy_kinematics.cpp)
   ament_target_dependencies(test_pose_hierarchy_kinematics ament_index_cpp)
   target_link_libraries(test_pose_hierarchy_kinematics qiling_dik_real_core)
@@ -188,5 +196,5 @@ endif()
 
 ament_export_targets(export_qiling_dik_real_core HAS_LIBRARY_TARGET)
 ament_export_include_directories(include)
-ament_export_dependencies(Eigen3 pinocchio proxsuite)
+ament_export_dependencies(Eigen3 pinocchio proxsuite yaml-cpp)
 ament_package()

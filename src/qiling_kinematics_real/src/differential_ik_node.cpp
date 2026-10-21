@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -23,6 +24,7 @@
 #include <mit_msgs/msg/mit_low_state.hpp>
 #include <pinocchio/spatial/explog.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -30,6 +32,8 @@
 #include "qiling_kinematics/arm_control_state.hpp"
 #include "qiling_kinematics/anthropomorphic_elbow.hpp"
 #include "qiling_kinematics/dual_arm_kinematics.hpp"
+#include "qiling_kinematics/gesture_motion.hpp"
+#include "qiling_kinematics/gesture_status.hpp"
 #include "qiling_kinematics/hierarchical_dik_solver.hpp"
 #include "qiling_kinematics/ik_diagnostics.hpp"
 #include "qiling_kinematics/ik_types.hpp"
@@ -52,6 +56,7 @@ using Clock = std::chrono::steady_clock;
 using PoseMsg = geometry_msgs::msg::PoseStamped;
 using ModeMsg = std_msgs::msg::UInt8;
 using Trigger = std_srvs::srv::Trigger;
+using JoyMsg = sensor_msgs::msg::Joy;
 using qiling_kinematics::ArmControlState;
 using qiling_kinematics::ArmKinematics;
 using qiling_kinematics::ArmScalarJacobian;
@@ -63,6 +68,11 @@ using qiling_kinematics::AnthropomorphicElbowConfig;
 using qiling_kinematics::AnthropomorphicElbowOutput;
 using qiling_kinematics::computeElbowSwivelJacobian;
 using qiling_kinematics::DualArmKinematics;
+using qiling_kinematics::GestureFrame;
+using qiling_kinematics::GestureKind;
+using qiling_kinematics::GesturePhase;
+using qiling_kinematics::GesturePlan;
+using qiling_kinematics::GestureStatus;
 using qiling_kinematics::HierarchicalDIKSolver;
 using qiling_kinematics::IkDiagnostics;
 using qiling_kinematics::SolverStatus;
@@ -79,6 +89,8 @@ struct WorkspaceGuardState
 {
   double bad_duration_sec{0.0};
 };
+
+enum class GestureRunPhase {Idle, Running, Settling, Handoff, Fault};
 
 enum class StartupHomePhase
 {
@@ -257,6 +269,14 @@ public:
     right_mode_sub_ = create_subscription<ModeMsg>(
       get_parameter("right_mode_topic").as_string(), rclcpp::SensorDataQoS(),
       [this](const ModeMsg::SharedPtr message) { updateMode(*message, kRightSide); });
+    gesture_joy_sub_ = create_subscription<JoyMsg>(
+      get_parameter("gesture_joy_topic").as_string(), rclcpp::SensorDataQoS(),
+      [this](const JoyMsg::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(gesture_joy_mutex_);
+        gesture_joy_ = *message;
+        gesture_joy_time_ = Clock::now();
+        gesture_joy_received_ = true;
+      });
 
     command_pub_ = create_publisher<mit_msgs::msg::MITJointCommands>(
       get_parameter("command_topic").as_string(), rclcpp::QoS(1));
@@ -269,6 +289,9 @@ public:
       rclcpp::QoS(1).transient_local());
     home_state_pub_ = create_publisher<std_msgs::msg::UInt8>(
       get_parameter("home_state_topic").as_string(),
+      rclcpp::QoS(1).transient_local());
+    gesture_status_pub_ = create_publisher<std_msgs::msg::UInt8>(
+      get_parameter("gesture_status_topic").as_string(),
       rclcpp::QoS(1).transient_local());
     recording_hold_service_ = create_service<Trigger>(
       get_parameter("recording_hold_service").as_string(),
@@ -319,6 +342,21 @@ private:
     declare_parameter(
       "recording_hold_service", std::string("/teleop/request_recording_hold"));
     declare_parameter("home_request_service", std::string("/teleop/request_home"));
+    declare_parameter("gesture_enabled", true);
+    declare_parameter("gesture_joy_topic", std::string("/xr/controller_joy"));
+    declare_parameter("gesture_status_topic", std::string("/teleop/gesture_status"));
+    declare_parameter(
+      "gesture_config_path",
+      ament_index_cpp::get_package_share_directory("qiling_kinematics_real") +
+      "/config/gesture_actions.yaml");
+    declare_parameter("gesture_joy_timeout_sec", 0.20);
+    declare_parameter("gesture_chord_stable_sec", 0.15);
+    declare_parameter("gesture_start_tracking_tolerance_rad", 0.15);
+    declare_parameter("gesture_motion_tracking_tolerance_rad", 0.35);
+    declare_parameter("gesture_home_tolerance_rad", 0.20);
+    declare_parameter("gesture_home_settle_sec", 0.20);
+    declare_parameter("gesture_home_settle_timeout_sec", 10.0);
+    declare_parameter("gesture_handoff_sec", 0.75);
 
     declare_parameter("target_timeout_sec", 0.25);
     declare_parameter("joint_state_timeout_sec", 0.20);
@@ -429,8 +467,8 @@ private:
   {
     const std::string description_share =
       ament_index_cpp::get_package_share_directory("qi_robot_description");
-    const auto urdf_path = std::filesystem::path(description_share) / "urdf" / "s4_dual_arm.urdf";
-    kinematics_ = std::make_unique<DualArmKinematics>(urdf_path);
+    urdf_path_ = std::filesystem::path(description_share) / "urdf" / "s4_dual_arm.urdf";
+    kinematics_ = std::make_unique<DualArmKinematics>(urdf_path_);
     const auto readVector = [this](const char * parameter_name) {
         const auto values = get_parameter(parameter_name).as_double_array();
         if (values.size() != kSingleArmDof) {
@@ -935,6 +973,7 @@ private:
   {
     std::array<ArmVector, kSideCount> measured;
     if (!home_complete_ || home_phase_ != StartupHomePhase::Complete ||
+      gesture_run_phase_ != GestureRunPhase::Idle ||
       !getFreshMeasuredArms(measured))
     {
       response->success = false;
@@ -1848,6 +1887,297 @@ private:
       diagnostics.elbow_scale);
   }
 
+  void publishGestureStatus()
+  {
+    std_msgs::msg::UInt8 message;
+    message.data = static_cast<std::uint8_t>(gesture_hand_status_);
+    gesture_status_pub_->publish(message);
+  }
+
+  std::optional<GestureKind> pendingGestureChord(Clock::time_point now_steady)
+  {
+    JoyMsg joy;
+    Clock::time_point received_at;
+    bool received;
+    {
+      std::lock_guard<std::mutex> lock(gesture_joy_mutex_);
+      joy = gesture_joy_;
+      received_at = gesture_joy_time_;
+      received = gesture_joy_received_;
+    }
+    if (!received || ageSeconds(now_steady, received_at, true) >
+      get_parameter("gesture_joy_timeout_sec").as_double() ||
+      joy.buttons.size() < 6 || joy.axes.size() < 4)
+    {
+      gesture_chord_candidate_ = 0;
+      return std::nullopt;
+    }
+    for (int i = 0; i < 4; ++i) {
+      if (!std::isfinite(joy.axes[i])) {
+        gesture_chord_candidate_ = 0;
+        return std::nullopt;
+      }
+    }
+    std::uint8_t buttons = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (joy.buttons[i] != 0) {
+        buttons |= static_cast<std::uint8_t>(1 << i);
+      }
+    }
+    const bool controls_released = joy.buttons[4] == 0 && joy.buttons[5] == 0 &&
+      joy.axes[0] < 0.25 && joy.axes[1] < 0.25 &&
+      std::abs(joy.axes[2]) < 0.30 && std::abs(joy.axes[3]) < 0.30;
+    if (buttons == 0 && controls_released) {
+      gesture_chord_armed_ = true;
+      gesture_chord_candidate_ = 0;
+      return std::nullopt;
+    }
+    if (!controls_released || !gesture_chord_armed_) {
+      gesture_chord_candidate_ = 0;
+      return std::nullopt;
+    }
+    std::optional<GestureKind> kind;
+    if (buttons == 0x03) { // X + A
+      kind = GestureKind::Wave;
+    } else if (buttons == 0x0c) { // Y + B
+      kind = GestureKind::Shake;
+    } else if (buttons == 0x09) { // X + B
+      kind = GestureKind::Baoquan;
+    }
+    if (!kind) {
+      gesture_chord_candidate_ = 0;
+      return std::nullopt;
+    }
+    if (buttons != gesture_chord_candidate_) {
+      gesture_chord_candidate_ = buttons;
+      gesture_chord_since_ = now_steady;
+      return std::nullopt;
+    }
+    if (ageSeconds(now_steady, gesture_chord_since_, true) <
+      get_parameter("gesture_chord_stable_sec").as_double())
+    {
+      return std::nullopt;
+    }
+    return kind;
+  }
+
+  void gestureFault(const std::string & reason)
+  {
+    if (gesture_run_phase_ == GestureRunPhase::Fault) {
+      return;
+    }
+    gesture_run_phase_ = GestureRunPhase::Fault;
+    gesture_hand_status_ = GestureStatus::Fault;
+    for (auto & velocity : gesture_command_qdot_) {
+      velocity.setZero();
+    }
+    publishGestureStatus();
+    RCLCPP_ERROR(get_logger(), "gesture locked in FAULT: %s", reason.c_str());
+  }
+
+  bool beginGesture(
+    GestureKind kind, const std::array<ArmVector, kSideCount> & measured)
+  {
+    const std::array<ArmVector, kSideCount> start = last_published_positions_;
+    const auto velocity_values = get_parameter("max_joint_velocity_rps").as_double_array();
+    const auto acceleration_values =
+      get_parameter("max_joint_acceleration_rps2").as_double_array();
+    if (velocity_values.size() != kSingleArmDof ||
+      acceleration_values.size() != kSingleArmDof)
+    {
+      RCLCPP_ERROR(get_logger(), "gesture rejected: invalid joint rate parameters");
+      return false;
+    }
+    ArmVector velocity;
+    ArmVector acceleration;
+    for (int i = 0; i < kSingleArmDof; ++i) {
+      velocity[i] = velocity_values[i];
+      acceleration[i] = acceleration_values[i];
+    }
+    try {
+      gesture_plan_ = GesturePlan::load(
+        get_parameter("gesture_config_path").as_string(), kind, start, home_q_,
+        q_min_, q_max_, velocity, acceleration);
+    } catch (const std::exception & error) {
+      RCLCPP_ERROR(
+        get_logger(), "gesture %s rejected by joint-space validation: %s",
+        qiling_kinematics::gestureName(kind), error.what());
+      return false;
+    }
+    for (int side = 0; side < kSideCount; ++side) {
+      const double tracking_error = (measured[side] - start[side]).cwiseAbs().maxCoeff();
+      if (tracking_error >
+        get_parameter("gesture_start_tracking_tolerance_rad").as_double())
+      {
+        RCLCPP_WARN(
+          get_logger(), "gesture %s rejected: %s arm tracking error %.3f rad",
+          qiling_kinematics::gestureName(kind), side == kLeftSide ? "left" : "right",
+          tracking_error);
+        gesture_plan_.reset();
+        return false;
+      }
+    }
+    left_control_.enterHold(measured[kLeftSide], true, "gesture owns both arms");
+    right_control_.enterHold(measured[kRightSide], true, "gesture owns both arms");
+    left_control_.synchronizeReference(start[kLeftSide], "gesture start command latched");
+    right_control_.synchronizeReference(start[kRightSide], "gesture start command latched");
+    resetTargetAndGuard(kLeftSide);
+    resetTargetAndGuard(kRightSide);
+    elbow_geometry_[kLeftSide].reset();
+    elbow_geometry_[kRightSide].reset();
+    teleop_side_ready_.fill(false);
+    gesture_command_q_ = start;
+    for (auto & value : gesture_command_qdot_) {
+      value.setZero();
+    }
+    gesture_elapsed_sec_ = 0.0;
+    gesture_phase_time_sec_ = 0.0;
+    gesture_settle_accum_sec_ = 0.0;
+    gesture_run_phase_ = GestureRunPhase::Running;
+    gesture_hand_status_ = kind == GestureKind::Wave ? GestureStatus::Wave :
+      kind == GestureKind::Baoquan ? GestureStatus::BaoquanPose : GestureStatus::ShakeOpen;
+    publishGestureStatus();
+    RCLCPP_INFO(
+      get_logger(), "gesture %s locked both arms; executing validated joint trajectory",
+      qiling_kinematics::gestureName(kind));
+    return true;
+  }
+
+  bool runGesture(
+    Clock::time_point now_steady,
+    const std::array<ArmVector, kSideCount> & measured,
+    bool left_fresh, bool right_fresh, bool control_stalled, double dt,
+    const std::array<std::uint8_t, kSideCount> & modes)
+  {
+    if (gesture_run_phase_ == GestureRunPhase::Idle) {
+      const auto chord = pendingGestureChord(now_steady);
+      if (!get_parameter("gesture_enabled").as_bool() || !chord ||
+        !left_fresh || !right_fresh || control_stalled ||
+        modes[kLeftSide] != 0 || modes[kRightSide] != 0 ||
+        !last_published_command_initialized_ ||
+        !left_control_.initialized() || !right_control_.initialized() ||
+        left_control_.state() != ArmRunState::Hold ||
+        right_control_.state() != ArmRunState::Hold)
+      {
+        return false;
+      }
+      gesture_chord_armed_ = false;
+      gesture_chord_candidate_ = 0;
+      if (!beginGesture(*chord, measured)) {
+        return false;
+      }
+    }
+
+    if (gesture_run_phase_ == GestureRunPhase::Fault) {
+      publishGestureStatus();
+      return true;
+    }
+    if (!left_fresh || !right_fresh || control_stalled) {
+      gestureFault("joint feedback stale or control loop stalled");
+      return true;
+    }
+    const double tracking_limit =
+      get_parameter("gesture_motion_tracking_tolerance_rad").as_double();
+    if (maxJointError(measured, gesture_command_q_) > tracking_limit)
+    {
+      gestureFault("arm feedback diverged from gesture command");
+      return true;
+    }
+    if (gesture_run_phase_ == GestureRunPhase::Running) {
+      gesture_elapsed_sec_ += dt;
+      const GestureFrame frame = gesture_plan_->sample(gesture_elapsed_sec_);
+      gesture_command_q_ = frame.position;
+      gesture_command_qdot_ = frame.velocity;
+      if (frame.phase == GesturePhase::ReturnHome || frame.phase == GesturePhase::Complete) {
+        gesture_hand_status_ = GestureStatus::ReturnOpen;
+      } else if (gesture_plan_->kind() == GestureKind::Wave) {
+        gesture_hand_status_ = GestureStatus::Wave;
+      } else if (gesture_plan_->kind() == GestureKind::Baoquan) {
+        gesture_hand_status_ = GestureStatus::BaoquanPose;
+      } else if (frame.phase == GesturePhase::GripWait || frame.phase == GesturePhase::Motion) {
+        gesture_hand_status_ = GestureStatus::ShakeGrip;
+      } else {
+        gesture_hand_status_ = GestureStatus::ShakeOpen;
+      }
+      if (frame.phase == GesturePhase::Complete) {
+        gesture_run_phase_ = GestureRunPhase::Settling;
+        gesture_phase_time_sec_ = 0.0;
+        gesture_settle_accum_sec_ = 0.0;
+      }
+    } else if (gesture_run_phase_ == GestureRunPhase::Settling) {
+      gesture_phase_time_sec_ += dt;
+      gesture_command_q_ = home_q_;
+      for (auto & value : gesture_command_qdot_) {
+        value.setZero();
+      }
+      const double left_home_error =
+        (measured[kLeftSide] - home_q_[kLeftSide]).cwiseAbs().maxCoeff();
+      const double right_home_error =
+        (measured[kRightSide] - home_q_[kRightSide]).cwiseAbs().maxCoeff();
+      const double home_tolerance =
+        get_parameter("gesture_home_tolerance_rad").as_double();
+      if (std::max(left_home_error, right_home_error) <= home_tolerance)
+      {
+        gesture_settle_accum_sec_ += dt;
+        if (gesture_settle_accum_sec_ >=
+          get_parameter("gesture_home_settle_sec").as_double())
+        {
+          RCLCPP_INFO(
+            get_logger(),
+            "gesture home settled: left_error=%.4f right_error=%.4f tolerance=%.4f rad",
+            left_home_error, right_home_error, home_tolerance);
+          gesture_handoff_start_ = home_q_;
+          gesture_handoff_target_ = measured;
+          gesture_run_phase_ = GestureRunPhase::Handoff;
+          gesture_phase_time_sec_ = 0.0;
+        }
+      } else {
+        gesture_settle_accum_sec_ = 0.0;
+      }
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "gesture waiting for home feedback: left_error=%.4f right_error=%.4f "
+        "tolerance=%.4f rad elapsed=%.2f s",
+        left_home_error, right_home_error, home_tolerance, gesture_phase_time_sec_);
+      if (gesture_phase_time_sec_ >
+        get_parameter("gesture_home_settle_timeout_sec").as_double())
+      {
+        gestureFault(
+          "gesture home feedback did not settle: left_error=" +
+          std::to_string(left_home_error) + " right_error=" +
+          std::to_string(right_home_error) + " tolerance=" +
+          std::to_string(home_tolerance));
+      }
+    } else if (gesture_run_phase_ == GestureRunPhase::Handoff) {
+      gesture_phase_time_sec_ += dt;
+      const double duration = std::max(
+        get_parameter("gesture_handoff_sec").as_double(), 0.02);
+      for (int side = 0; side < kSideCount; ++side) {
+        quinticSegment(
+          gesture_handoff_start_[side], gesture_handoff_target_[side],
+          gesture_phase_time_sec_, duration,
+          gesture_command_q_[side], gesture_command_qdot_[side]);
+      }
+      if (gesture_phase_time_sec_ >= duration) {
+        left_control_.synchronizeReference(
+          gesture_handoff_target_[kLeftSide], "gesture handoff complete");
+        right_control_.synchronizeReference(
+          gesture_handoff_target_[kRightSide], "gesture handoff complete");
+        left_control_.updateGripRequest(false, measured[kLeftSide]);
+        right_control_.updateGripRequest(false, measured[kRightSide]);
+        teleop_side_ready_.fill(false);
+        gesture_chord_armed_ = false;
+        gesture_chord_candidate_ = 0;
+        gesture_run_phase_ = GestureRunPhase::Idle;
+        gesture_hand_status_ = GestureStatus::Idle;
+        gesture_plan_.reset();
+        RCLCPP_INFO(get_logger(), "gesture returned home; teleoperation rearmed after Grip release");
+      }
+    }
+    publishGestureStatus();
+    return true;
+  }
+
   void controlTick()
   {
     const auto now_steady = Clock::now();
@@ -1868,6 +2198,7 @@ private:
       !std::isfinite(raw_dt) ||
       raw_dt > get_parameter("control_stall_fault_sec").as_double();
     updateGravityBlend(dt);
+    publishGestureStatus();
 
     std::array<ArmVector, kSideCount> q_snapshot;
     std::array<double, kLegMotorCount> leg_q_snapshot;
@@ -1956,6 +2287,18 @@ private:
     }
 
     publishHomeStatus();
+
+    // An accepted gesture owns the same single arm command publisher used by
+    // teleoperation. The independent Grip targets are ignored until the
+    // trajectory has returned home and the handoff has finished.
+    if (runGesture(
+        now_steady, q_snapshot, left_state_fresh, right_state_fresh,
+        control_stalled, dt, modes))
+    {
+      publishCommand(
+        leg_q_snapshot, q_snapshot, gesture_command_q_, gesture_command_qdot_);
+      return;
+    }
 
     // A Grip held while home was running must not cause a target jump. Each
     // side becomes eligible only after its own Grip has been released once.
@@ -2176,6 +2519,7 @@ private:
   }
 
   std::unique_ptr<DualArmKinematics> kinematics_;
+  std::filesystem::path urdf_path_;
   std::array<ArmVector, kSideCount> q_state_{};
   std::array<double, kLegMotorCount> leg_q_state_{};
   std::array<ArmVector, kSideCount> q_min_{};
@@ -2218,6 +2562,23 @@ private:
   std::mutex state_mutex_;
   std::mutex target_mutex_;
   std::mutex mode_mutex_;
+  JoyMsg gesture_joy_;
+  Clock::time_point gesture_joy_time_{};
+  Clock::time_point gesture_chord_since_{};
+  std::mutex gesture_joy_mutex_;
+  bool gesture_joy_received_{false};
+  bool gesture_chord_armed_{false};
+  std::uint8_t gesture_chord_candidate_{0};
+  GestureRunPhase gesture_run_phase_{GestureRunPhase::Idle};
+  GestureStatus gesture_hand_status_{GestureStatus::Idle};
+  std::optional<GesturePlan> gesture_plan_;
+  std::array<ArmVector, kSideCount> gesture_command_q_{};
+  std::array<ArmVector, kSideCount> gesture_command_qdot_{};
+  std::array<ArmVector, kSideCount> gesture_handoff_start_{};
+  std::array<ArmVector, kSideCount> gesture_handoff_target_{};
+  double gesture_elapsed_sec_{0.0};
+  double gesture_phase_time_sec_{0.0};
+  double gesture_settle_accum_sec_{0.0};
 
   StartupHomePhase home_phase_{StartupHomePhase::WaitingForState};
   bool home_started_{false};
@@ -2242,11 +2603,13 @@ private:
   rclcpp::Subscription<PoseMsg>::SharedPtr right_target_sub_;
   rclcpp::Subscription<ModeMsg>::SharedPtr left_mode_sub_;
   rclcpp::Subscription<ModeMsg>::SharedPtr right_mode_sub_;
+  rclcpp::Subscription<JoyMsg>::SharedPtr gesture_joy_sub_;
   rclcpp::Publisher<mit_msgs::msg::MITJointCommands>::SharedPtr command_pub_;
   rclcpp::Publisher<PoseMsg>::SharedPtr left_state_pub_;
   rclcpp::Publisher<PoseMsg>::SharedPtr right_state_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr home_complete_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr home_state_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr gesture_status_pub_;
   rclcpp::Service<Trigger>::SharedPtr recording_hold_service_;
   rclcpp::Service<Trigger>::SharedPtr home_request_service_;
   rclcpp::TimerBase::SharedPtr control_timer_;

@@ -1,9 +1,13 @@
 qiling_o6_command_adapter:
   ros__parameters:
     state_topic: "/teleop/o6_trigger_state"
+    gesture_status_topic: "/teleop/gesture_status"
     command_topic: "/handscmd"
     home_complete_topic: "/teleop/startup_home_complete"
     require_home_complete: true
     open_position: [255, 104, 255, 255, 255, 255]
     close_position: [101, 60, 0, 0, 0, 0]
     speed: 200
+    # Inverse-normalized from the original 0..100 action hand positions.
+    gesture_shake_right_position: [115, 115, 204, 204, 204, 204]
+    gesture_baoquan_right_position: [102, 102, 0, 0, 0, 0]

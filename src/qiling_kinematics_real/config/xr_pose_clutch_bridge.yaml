@@ -4,6 +4,7 @@ qiling_xr_pose_clutch_bridge_real:
     left_pose_topic: "/xr/left_controller_pose"
     right_pose_topic: "/xr/right_controller_pose"
     joy_topic: "/xr/controller_joy"
+    gesture_status_topic: "/teleop/gesture_status"
     left_robot_state_topic: "/teleop/left_wrist_state"
     right_robot_state_topic: "/teleop/right_wrist_state"
     left_target_topic: "/teleop/left_wrist_target"

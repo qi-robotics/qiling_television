@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "qiling_kinematics/gesture_status.hpp"
 #include "qi/msg/hands_cmd.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -20,6 +21,7 @@ constexpr std::uint8_t kLeftMask = 0x01;
 constexpr std::uint8_t kRightMask = 0x02;
 
 using Position = std::array<std::uint16_t, kFingerCount>;
+using qiling_kinematics::GestureStatus;
 
 bool readPositionParameter(
   rclcpp::Node & node, const char * name, const Position & defaults, Position & values)
@@ -71,11 +73,19 @@ public:
     declare_parameter(
       "home_complete_topic", std::string("/teleop/startup_home_complete"));
     declare_parameter("require_home_complete", true);
+    declare_parameter("gesture_status_topic", std::string("/teleop/gesture_status"));
+    declare_parameter("gesture_status_timeout_sec", 0.30);
 
     const Position default_open = {255, 104, 255, 255, 255, 255};
     const Position default_close = {101, 60, 0, 0, 0, 0};
     if (!readPositionParameter(*this, "open_position", default_open, open_position_) ||
-      !readPositionParameter(*this, "close_position", default_close, close_position_))
+      !readPositionParameter(*this, "close_position", default_close, close_position_) ||
+      !readPositionParameter(
+        *this, "gesture_shake_right_position", Position{115, 115, 204, 204, 204, 204},
+        gesture_shake_right_position_) ||
+      !readPositionParameter(
+        *this, "gesture_baoquan_right_position", Position{102, 102, 0, 0, 0, 0},
+        gesture_baoquan_right_position_))
     {
       throw std::runtime_error("invalid O6 position parameter");
     }
@@ -98,9 +108,18 @@ public:
     home_sub_ = create_subscription<std_msgs::msg::Bool>(
       home_topic, rclcpp::QoS(1).transient_local(),
       [this](const std_msgs::msg::Bool::SharedPtr message) {
+        if (home_status_received_ && home_complete_ == message->data) {
+          return;
+        }
+        home_status_received_ = true;
         home_complete_ = message->data;
         RCLCPP_INFO(
           get_logger(), "startup home complete=%s", home_complete_ ? "true" : "false");
+      });
+    gesture_sub_ = create_subscription<std_msgs::msg::UInt8>(
+      get_parameter("gesture_status_topic").as_string(), rclcpp::QoS(1).transient_local(),
+      [this](const std_msgs::msg::UInt8::SharedPtr message) {
+        onGestureStatus(message->data);
       });
 
     RCLCPP_INFO(
@@ -114,11 +133,59 @@ public:
   }
 
 private:
+  void onGestureStatus(std::uint8_t raw)
+  {
+    gesture_status_received_ = true;
+    last_gesture_status_time_ = std::chrono::steady_clock::now();
+    const GestureStatus next = raw <= static_cast<std::uint8_t>(GestureStatus::Preflight) ?
+      static_cast<GestureStatus>(raw) : GestureStatus::Fault;
+    if (next == gesture_status_) {
+      return;
+    }
+    const GestureStatus previous = gesture_status_;
+    gesture_status_ = next;
+    if (next == GestureStatus::Idle) {
+      if (previous != GestureStatus::Idle) {
+        trigger_release_ready_ = false;
+        have_state_ = false;
+      }
+      return;
+    }
+    trigger_release_ready_ = false;
+    if (next == GestureStatus::Preflight || next == GestureStatus::Fault) {
+      return; // Retain the last physical hand target while motion is locked.
+    }
+    if (next == GestureStatus::ShakeGrip) {
+      publishPositions(open_position_, gesture_shake_right_position_, "gesture shake grip");
+    } else if (next == GestureStatus::BaoquanPose) {
+      publishPositions(open_position_, gesture_baoquan_right_position_, "gesture baoquan pose");
+    } else {
+      publishPositions(open_position_, open_position_, "gesture hands open");
+    }
+  }
+
   void onTriggerState(std::uint8_t raw_state)
   {
     const std::uint8_t state = raw_state & (kLeftMask | kRightMask);
+    if (!gesture_status_received_ ||
+      std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - last_gesture_status_time_).count() >
+      get_parameter("gesture_status_timeout_sec").as_double())
+    {
+      return;
+    }
+    if (gesture_status_ != GestureStatus::Idle) {
+      return;
+    }
     if (get_parameter("require_home_complete").as_bool() && !home_complete_) {
       return;
+    }
+    if (!trigger_release_ready_) {
+      if (state != 0) {
+        return;
+      }
+      trigger_release_ready_ = true;
+      have_state_ = false;
     }
 
     if (!have_state_) {
@@ -141,7 +208,12 @@ private:
   {
     const Position & left_position = (state & kLeftMask) != 0 ? close_position_ : open_position_;
     const Position & right_position = (state & kRightMask) != 0 ? close_position_ : open_position_;
+    publishPositions(left_position, right_position, reason);
+  }
 
+  void publishPositions(
+    const Position & left_position, const Position & right_position, const char * reason)
+  {
     qi::msg::HandsCmd command;
     command.mode = 1;
     command.mode_ctrl = 1;
@@ -169,13 +241,21 @@ private:
 
   Position open_position_{};
   Position close_position_{};
+  Position gesture_shake_right_position_{};
+  Position gesture_baoquan_right_position_{};
   int speed_{200};
   bool home_complete_{false};
+  bool home_status_received_{false};
   bool have_state_{false};
+  bool trigger_release_ready_{false};
+  bool gesture_status_received_{false};
+  GestureStatus gesture_status_{GestureStatus::Idle};
+  std::chrono::steady_clock::time_point last_gesture_status_time_{};
   std::uint8_t last_state_{0};
   rclcpp::Publisher<qi::msg::HandsCmd>::SharedPtr command_pub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr state_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr home_sub_;
+  rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr gesture_sub_;
 };
 
 int main(int argc, char ** argv)

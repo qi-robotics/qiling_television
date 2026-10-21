@@ -15,6 +15,15 @@ qiling_differential_ik_real:
     home_state_topic: "/teleop/home_state"
     recording_hold_service: "/teleop/request_recording_hold"
     home_request_service: "/teleop/request_home"
+    # Gesture chords are available after startup home completes.
+    gesture_enabled: true
+    gesture_joy_topic: "/xr/controller_joy"
+    gesture_status_topic: "/teleop/gesture_status"
+    # The longer handoff keeps the measured-pose transition within the
+    # configured gesture joint-rate and acceleration limits at 0.20 rad.
+    gesture_home_tolerance_rad: 0.20
+    gesture_home_settle_timeout_sec: 10.0
+    gesture_handoff_sec: 0.75
     target_frame: "base_link"
     target_timeout_sec: 0.25
     joint_state_timeout_sec: 0.20

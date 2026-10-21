@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -15,12 +16,15 @@
 #include <sensor_msgs/msg/joy.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 
+#include "qiling_kinematics/gesture_status.hpp"
+
 namespace
 {
 using PoseMsg = geometry_msgs::msg::PoseStamped;
 using JoyMsg = sensor_msgs::msg::Joy;
 using ModeMsg = std_msgs::msg::UInt8;
 using Clock = std::chrono::steady_clock;
+using qiling_kinematics::GestureStatus;
 
 struct TimedPose
 {
@@ -181,6 +185,19 @@ public:
         joy_.received_at = Clock::now();
         joy_.valid = true;
       });
+    gesture_status_sub_ = create_subscription<ModeMsg>(
+      get_parameter("gesture_status_topic").as_string(), rclcpp::QoS(1).transient_local(),
+      [this](const ModeMsg::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto next = message->data <= static_cast<std::uint8_t>(GestureStatus::Preflight) ?
+          static_cast<GestureStatus>(message->data) : GestureStatus::Fault;
+        if (next != GestureStatus::Idle || gesture_status_ != GestureStatus::Idle) {
+          grip_rearm_required_.fill(true);
+        }
+        gesture_status_ = next;
+        gesture_status_received_ = true;
+        gesture_status_time_ = Clock::now();
+      });
 
     left_target_pub_ = create_publisher<PoseMsg>(
       get_parameter("left_target_topic").as_string(), rclcpp::QoS(1));
@@ -215,6 +232,8 @@ private:
     declare_parameter("left_pose_topic", std::string("/xr/left_controller_pose"));
     declare_parameter("right_pose_topic", std::string("/xr/right_controller_pose"));
     declare_parameter("joy_topic", std::string("/xr/controller_joy"));
+    declare_parameter("gesture_status_topic", std::string("/teleop/gesture_status"));
+    declare_parameter("gesture_status_timeout_sec", 0.30);
     declare_parameter("left_robot_state_topic", std::string("/teleop/left_wrist_state"));
     declare_parameter("right_robot_state_topic", std::string("/teleop/right_wrist_state"));
     declare_parameter("left_target_topic", std::string("/teleop/left_wrist_target"));
@@ -394,16 +413,31 @@ private:
   void tick()
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool gesture_locked = gesture_status_received_ &&
+      (gesture_status_ != GestureStatus::Idle ||
+      std::chrono::duration<double>(Clock::now() - gesture_status_time_).count() >
+      get_parameter("gesture_status_timeout_sec").as_double());
+    if (gesture_locked) {
+      grip_rearm_required_.fill(true);
+    }
+    bool left_pressed = gripPressed(
+      get_parameter("left_grip_button").as_int(),
+      get_parameter("left_grip_axis").as_int());
+    bool right_pressed = gripPressed(
+      get_parameter("right_grip_button").as_int(),
+      get_parameter("right_grip_axis").as_int());
+    if (!left_pressed && !gesture_locked) {
+      grip_rearm_required_[0] = false;
+    }
+    if (!right_pressed && !gesture_locked) {
+      grip_rearm_required_[1] = false;
+    }
+    left_pressed = left_pressed && !gesture_locked && !grip_rearm_required_[0];
+    right_pressed = right_pressed && !gesture_locked && !grip_rearm_required_[1];
     processSide(
-      left_,
-      gripPressed(
-        get_parameter("left_grip_button").as_int(),
-        get_parameter("left_grip_axis").as_int()));
+      left_, left_pressed);
     processSide(
-      right_,
-      gripPressed(
-        get_parameter("right_grip_button").as_int(),
-        get_parameter("right_grip_axis").as_int()));
+      right_, right_pressed);
 
     const rclcpp::Time stamp = now();
     const std::string frame = get_parameter("target_frame").as_string();
@@ -426,6 +460,10 @@ private:
   SideState left_;
   SideState right_;
   TimedJoy joy_;
+  GestureStatus gesture_status_{GestureStatus::Idle};
+  Clock::time_point gesture_status_time_{};
+  std::array<bool, 2> grip_rearm_required_{};
+  bool gesture_status_received_{false};
   std::mutex mutex_;
 
   rclcpp::Subscription<PoseMsg>::SharedPtr left_pose_sub_;
@@ -433,6 +471,7 @@ private:
   rclcpp::Subscription<PoseMsg>::SharedPtr left_robot_sub_;
   rclcpp::Subscription<PoseMsg>::SharedPtr right_robot_sub_;
   rclcpp::Subscription<JoyMsg>::SharedPtr joy_sub_;
+  rclcpp::Subscription<ModeMsg>::SharedPtr gesture_status_sub_;
   rclcpp::Publisher<PoseMsg>::SharedPtr left_target_pub_;
   rclcpp::Publisher<PoseMsg>::SharedPtr right_target_pub_;
   rclcpp::Publisher<ModeMsg>::SharedPtr left_mode_pub_;

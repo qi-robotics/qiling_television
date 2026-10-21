@@ -19,6 +19,7 @@
   <depend>qi_robot_description</depend>
   <depend>eigen</depend>
   <depend>pinocchio</depend>
+  <depend>yaml-cpp</depend>
   <depend>proxsuite</depend>
   <depend>qi</depend>
   <exec_depend>ament_index_python</exec_depend>
