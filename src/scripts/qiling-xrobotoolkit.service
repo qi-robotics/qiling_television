@@ -1,0 +1,21 @@
+[Unit]
+Description=Qiling XRoboToolkit PC Service (Jetson NX)
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/liujun/qiling_television
+Environment=QT_QPA_PLATFORM=offscreen
+ExecStartPre=/home/user/liujun/qiling_television/src/scripts/wait_for_boot_60s.sh
+ExecStart=/home/user/liujun/qiling_television/src/scripts/run_xrobotoolkit_supervised.sh
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

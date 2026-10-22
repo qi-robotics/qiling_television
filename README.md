@@ -4,6 +4,8 @@
 
 部署背景、网卡核对结果和 SDK 包校验记录见 [handoff.md](handoff.md)。节点接口细节见 [真机包说明](src/qiling_kinematics_real/README.md)。
 
+如需 NX 开机满 60 秒后自动启动 PC Service 与真机遥操，参见 [开机自启说明](src/scripts/真机遥操开机自启.md)。启用后每次开机只要板子状态可达，双臂会自动回 home。
+
 ## 当前链路
 
 ~~~text

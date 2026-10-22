@@ -1,0 +1,21 @@
+[Unit]
+Description=Qiling dual-arm XR real teleoperation (Jetson NX)
+BindsTo=qiling-xrobotoolkit.service
+After=qiling-xrobotoolkit.service
+
+[Service]
+Type=exec
+User=user
+Group=user
+WorkingDirectory=/home/user/liujun/qiling_television
+Environment=QILING_STATE_WAIT_SEC=120
+ExecStartPre=/usr/bin/sleep 3
+ExecStart=/home/user/liujun/qiling_television/src/scripts/start_real_teleop.sh
+# A restart would run startup home again, so require an operator to investigate.
+Restart=no
+KillSignal=SIGINT
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
