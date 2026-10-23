@@ -105,12 +105,10 @@ qiling_differential_ik_real:
     left_home_transition_q: [1.0, 1.2, 0.0, -1.2, 0.0, 0.0, 0.0]
     right_home_transition_q: [1.0, -1.2, 0.0, -1.2, 0.0, 0.0, 0.0]
     # Phase 5.0/5.2: geometry is also used by the safe tertiary elbow task.
-    # Do not continuously bias the elbows away from the torso. Retain a
-    # moderate home-direction preference while favoring a lower elbow.
     elbow_geometry_diagnostic_enabled: true
-    elbow_outward_weight: 0.0
-    elbow_downward_weight: 0.45
-    elbow_home_weight: 0.55
+    elbow_outward_weight: 0.25
+    elbow_downward_weight: 0.30
+    elbow_home_weight: 0.40
     min_shoulder_wrist_distance_m: 0.05
     min_elbow_projection_radius_m: 0.02
     max_joint_velocity_rps: [1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.2]

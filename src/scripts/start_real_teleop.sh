@@ -43,8 +43,17 @@ echo "复用已自启的 qi_topic_converter 状态输出；遥操命令通过专
 echo "确认机器人 SDK 已启动、双臂周围无障碍物并准备好急停。"
 
 state_wait_sec="${QILING_STATE_WAIT_SEC:-30}"
-if ! timeout "$state_wait_sec" ros2 topic echo /human_lower_state --once >/dev/null 2>&1; then
-  echo "错误：${state_wait_sec} 秒内未收到 /human_lower_state。请检查已自启的 SDK、qi_topic_converter 和 DDS 配置。" >&2
+echo "等待 /human_lower_state 首条 MITLowState 消息，最长 ${state_wait_sec} 秒。"
+state_wait_status=0
+timeout --kill-after=5s "$state_wait_sec" \
+  ros2 topic echo --no-daemon /human_lower_state mit_msgs/msg/MITLowState --once \
+  >/dev/null || state_wait_status=$?
+if (( state_wait_status != 0 )); then
+  if (( state_wait_status == 124 )); then
+    echo "错误：等待 ${state_wait_sec} 秒后仍未收到 /human_lower_state。请检查板子 SDK、qi_topic_converter 和 DDS 配置。" >&2
+  else
+    echo "错误：/human_lower_state 状态检查提前退出（退出码 ${state_wait_status}）；请查看上方 ROS 错误日志。" >&2
+  fi
   exit 2
 fi
 
