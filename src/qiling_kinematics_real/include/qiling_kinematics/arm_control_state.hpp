@@ -20,6 +20,8 @@ public:
   void updateGripRequest(bool pressed, const ArmVector & measured);
   void enterHold(
     const ArmVector & measured, bool require_release, const std::string & reason);
+  void enterProtectiveHold(bool require_release, const std::string & reason);
+  void completeRecovery(const ArmVector & reference);
   void rejectActivation(
     bool pressed, const ArmVector & measured, const std::string & reason);
   void enterLimitRecovery(
@@ -35,7 +37,7 @@ public:
   bool integrateReference(
     const ArmVector & qdot, double dt, const ArmVector & measured,
     const ArmVector & q_min, const ArmVector & q_max,
-    double max_tracking_error);
+    double max_tracking_error, int tracking_exempt_joint = -1);
 
   bool initialized() const;
   bool active() const;

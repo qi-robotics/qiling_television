@@ -10,7 +10,7 @@
 namespace qiling_kinematics
 {
 
-enum class GestureKind {Wave, Shake, Baoquan, Home};
+enum class GestureKind {Wave, Shake, Baoquan, Home, Zero};
 enum class GesturePhase {Entry, GripWait, Motion, ReturnHome, Complete};
 
 const char * gestureName(GestureKind kind);
@@ -39,6 +39,7 @@ public:
   GestureFrame sample(double elapsed_sec) const;
   double totalDuration() const;
   GestureKind kind() const {return kind_;}
+  const std::array<ArmVector, 2> & endPose() const {return home_;}
   std::array<double, 3> segmentDurations() const {return durations_;}
 
 private:
@@ -70,6 +71,10 @@ private:
 // on success or the first offending geometry pair / model error on failure.
 std::string checkGestureCollisions(
   const GesturePlan & plan,
+  const std::filesystem::path & urdf_path,
+  const std::filesystem::path & package_parent);
+
+std::string prewarmArmCollisionGeometry(
   const std::filesystem::path & urdf_path,
   const std::filesystem::path & package_parent);
 

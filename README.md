@@ -68,7 +68,7 @@ cd ~/liujun/qiling_television
 QILING_STATE_WAIT_SEC=60 ./src/scripts/start_real_teleop.sh
 ~~~
 
-home 完成后，左右 Grip 都先完整松开一次；再按住对应 Grip 控制该侧手臂，松开则保持。左右 Trigger 分别控制左右 O6 灵巧手开合。左臂在反馈接近 URDF 限位时，只有保持的命令目标指向安全区且未越过硬限位，才允许重新握紧 Grip 后接管；其余情况进入限位恢复。
+home 完成后，左右 Grip 都先完整松开一次；再按住对应 Grip 控制该侧手臂，松开则保持。左右 Trigger 分别控制左右 O6 灵巧手开合。手型目标会以 10 Hz 重发；动作结束后每侧 Trigger 单独松开一次即可重新控制该手。左臂在反馈接近 URDF 限位时，只有保持的命令目标指向安全区且未越过硬限位，才允许重新握紧 Grip 后接管；其余情况进入限位恢复。X+A、Y+B、X+B 分别触发挥手、握手、抱拳；A+B 使双臂回关节零位并保持。Y+A 可从遥操或故障保持状态请求双臂回 home，允许 Grip/Trigger 按住；节点会先检查从最后命令到实测构型再到 home 的路径，必要时尝试经过关节零位。详见 [真机 IK 与恢复说明](src/qiling_kinematics_real/README.md)。
 
 遥操终端按 Ctrl+C 停止本次 launch；PC Service 仍在后台运行。需要停止服务时执行：
 

@@ -58,13 +58,9 @@ void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured
 
   if (!pressed) {
     if (state_ == ArmRunState::Fault) {
-      state_ = ArmRunState::Hold;
-      release_required_ = false;
-      consecutive_solve_failures_ = 0;
-      reason_ = "Grip released";
-      // A fault invalidates the previous command reference. Re-synchronize
-      // with feedback before accepting another active command.
-      resetMotion(measured);
+      // A fault owns the last published command until the independent home
+      // recovery has safely reconciled it with feedback.
+      previous_velocity_.setZero();
     } else if (release_required_) {
       state_ = ArmRunState::Hold;
       release_required_ = false;
@@ -96,6 +92,33 @@ void ArmControlState::updateGripRequest(bool pressed, const ArmVector & measured
     // Hold -> Active edge bumpless; measured is intentionally not copied here.
     previous_velocity_.setZero();
   }
+}
+
+void ArmControlState::enterProtectiveHold(
+  bool require_release, const std::string & reason)
+{
+  if (!initialized_) {
+    return;
+  }
+  state_ = ArmRunState::Hold;
+  release_required_ = release_required_ || require_release;
+  previous_velocity_.setZero();
+  consecutive_solve_failures_ = 0;
+  reason_ = reason;
+}
+
+void ArmControlState::completeRecovery(const ArmVector & reference)
+{
+  if (!initialized_ || !reference.allFinite()) {
+    return;
+  }
+  state_ = ArmRunState::Hold;
+  reference_ = reference;
+  previous_velocity_.setZero();
+  release_required_ = true;
+  grip_pressed_ = false;
+  consecutive_solve_failures_ = 0;
+  reason_ = "home recovery complete";
 }
 
 void ArmControlState::enterHold(
@@ -180,7 +203,7 @@ void ArmControlState::enterFault(const ArmVector & measured, const std::string &
   state_ = ArmRunState::Fault;
   release_required_ = true;
   reason_ = reason;
-  resetMotion(measured);
+  previous_velocity_.setZero();
 }
 
 void ArmControlState::recordSolveSuccess()
@@ -196,7 +219,7 @@ void ArmControlState::recordSolveFailure(
   }
 
   ++consecutive_solve_failures_;
-  resetMotion(measured);
+  previous_velocity_.setZero();
   reason_ = reason;
 
   if (consecutive_solve_failures_ >= std::max(failures_to_fault, 1)) {
@@ -207,29 +230,43 @@ void ArmControlState::recordSolveFailure(
 
 bool ArmControlState::integrateReference(
   const ArmVector & qdot, double dt, const ArmVector & measured,
-  const ArmVector & q_min, const ArmVector & q_max, double max_tracking_error)
+  const ArmVector & q_min, const ArmVector & q_max, double max_tracking_error,
+  int tracking_exempt_joint)
 {
   if (!initialized_ || state_ != ArmRunState::Active ||
     !qdot.allFinite() || !measured.allFinite() || !q_min.allFinite() ||
     !q_max.allFinite() || !std::isfinite(dt) || dt <= 0.0 ||
-    !std::isfinite(max_tracking_error) || max_tracking_error < 0.0)
+    !std::isfinite(max_tracking_error) || max_tracking_error < 0.0 ||
+    tracking_exempt_joint < -1 || tracking_exempt_joint >= kSingleArmDof)
   {
     return false;
   }
 
+  const ArmVector old_reference = reference_;
+  ArmVector next_reference = reference_;
   for (int i = 0; i < kSingleArmDof; ++i) {
     if (q_min[i] > q_max[i] || measured[i] < q_min[i] || measured[i] > q_max[i]) {
       return false;
     }
     const double integrated = reference_[i] + dt * qdot[i];
-    const double tracking_min = std::max(q_min[i], measured[i] - max_tracking_error);
-    const double tracking_max = std::min(q_max[i], measured[i] + max_tracking_error);
+    const double tracking_min = i == tracking_exempt_joint ? q_min[i] :
+      std::max(q_min[i], measured[i] - max_tracking_error);
+    const double tracking_max = i == tracking_exempt_joint ? q_max[i] :
+      std::min(q_max[i], measured[i] + max_tracking_error);
     if (tracking_min > tracking_max) {
       return false;
     }
-    reference_[i] = std::clamp(integrated, tracking_min, tracking_max);
+    // Never allow the moving feedback envelope to create an unbounded
+    // command step. If it has moved beyond a rate-bounded next reference,
+    // the caller enters a latched protective fault instead.
+    const double next = std::clamp(integrated, tracking_min, tracking_max);
+    if (std::abs(next - reference_[i]) > std::abs(qdot[i] * dt) + 1.0e-9) {
+      return false;
+    }
+    next_reference[i] = next;
   }
-  previous_velocity_ = qdot;
+  reference_ = next_reference;
+  previous_velocity_ = (reference_ - old_reference) / dt;
   return reference_.allFinite();
 }
 

@@ -19,19 +19,31 @@ qiling_differential_ik_real:
     gesture_enabled: true
     gesture_joy_topic: "/xr/controller_joy"
     gesture_status_topic: "/teleop/gesture_status"
+    gesture_start_tracking_tolerance_rad: 0.30
     # The longer handoff keeps the measured-pose transition within the
     # configured gesture joint-rate and acceleration limits at 0.20 rad.
     gesture_home_tolerance_rad: 0.20
     gesture_home_settle_timeout_sec: 10.0
     gesture_handoff_sec: 0.75
+    recovery_tracking_tolerance_rad: 0.35
+    recovery_tracking_timeout_sec: 0.50
     target_frame: "base_link"
     target_timeout_sec: 0.25
     joint_state_timeout_sec: 0.20
     min_control_dt_sec: 0.01
     max_control_dt_sec: 0.04
     control_stall_fault_sec: 0.10
-    target_filter_enabled: true
+    target_filter_enabled: false
     target_filter_time_constant_sec: 0.04
+    target_max_position_lead_m: 0.08
+    target_max_orientation_lead_rad: 0.30
+    tracking_slowdown_start_rad: 0.10
+    tracking_stop_rad: 0.35
+    tracking_hold_timeout_sec: 0.30
+    # When false, left_wrist_yaw feedback error does not throttle or hold
+    # teleoperation and does not block gesture start/motion tracking checks.
+    # URDF position and velocity limits remain active.
+    left_wrist_yaw_tracking_guard_enabled: false
     workspace_guard_enabled: true
     workspace_guard_error_m: 0.03
     workspace_guard_timeout_sec: 0.25
@@ -47,6 +59,8 @@ qiling_differential_ik_real:
     position_singularity_speed_scale_min: 0.0
     position_regularization: 0.0001
     position_smoothness_weight: 0.001
+    position_posture_weight: 0.002
+    position_posture_gain: 0.50
     rotation_gain: 3.0
     max_angular_velocity_rps: 0.80
     orientation_error_deadband_rad: 0.01

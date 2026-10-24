@@ -27,6 +27,8 @@ add_library(qiling_dik_real_core
   src/dual_arm_kinematics.cpp
   src/gesture_motion.cpp
   src/hierarchical_dik_solver.cpp
+  src/recovery_home_plan.cpp
+  src/servo_target_governor.cpp
 )
 
 target_include_directories(qiling_dik_real_core PUBLIC
@@ -164,6 +166,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_arm_control_state test/test_arm_control_state.cpp)
   target_link_libraries(test_arm_control_state qiling_dik_real_core)
+
+  ament_add_gtest(test_servo_target_governor test/test_servo_target_governor.cpp)
+  target_link_libraries(test_servo_target_governor qiling_dik_real_core)
+
+  ament_add_gtest(test_recovery_home_plan test/test_recovery_home_plan.cpp)
+  target_link_libraries(test_recovery_home_plan qiling_dik_real_core)
 
   ament_add_gtest(test_anthropomorphic_elbow test/test_anthropomorphic_elbow.cpp)
   ament_target_dependencies(test_anthropomorphic_elbow ament_index_cpp)

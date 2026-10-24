@@ -82,6 +82,7 @@ bool finitePositionInput(const HierarchicalDIKSolver::PositionInput & input)
   return input.jacobian.allFinite() &&
          input.position_error.allFinite() &&
          input.q_measured.allFinite() &&
+         input.q_rest.allFinite() &&
          input.q_min.allFinite() &&
          input.q_max.allFinite() &&
          input.qdot_previous.allFinite() &&
@@ -320,6 +321,10 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
     !std::isfinite(config.position_regularization) || config.position_regularization < 0.0 ||
     !std::isfinite(config.position_smoothness_weight) ||
     config.position_smoothness_weight < 0.0 ||
+    !std::isfinite(config.position_posture_weight) ||
+    config.position_posture_weight < 0.0 ||
+    !std::isfinite(config.position_posture_gain) ||
+    config.position_posture_gain < 0.0 ||
     !std::isfinite(config.joint_limit_margin) || config.joint_limit_margin < 0.0 ||
     !std::isfinite(config.joint_limit_damper_gain) ||
     config.joint_limit_damper_gain <= 0.0 ||
@@ -360,11 +365,14 @@ HierarchicalDIKSolver::Result HierarchicalDIKSolver::solvePositionPrimary(
   const Eigen::Matrix<double, kSingleArmDof, kSingleArmDof> identity =
     Eigen::Matrix<double, kSingleArmDof, kSingleArmDof>::Identity();
   impl_->qp.model.H = input.jacobian.transpose() * input.jacobian +
-    (config.position_regularization + config.position_smoothness_weight) * identity;
+    (config.position_regularization + config.position_smoothness_weight +
+    config.position_posture_weight) * identity;
   impl_->qp.model.H = 0.5 * (impl_->qp.model.H + impl_->qp.model.H.transpose());
   impl_->qp.model.g =
     -input.jacobian.transpose() * result.desired_linear_velocity -
-    config.position_smoothness_weight * input.qdot_previous;
+    config.position_smoothness_weight * input.qdot_previous -
+    config.position_posture_weight * config.position_posture_gain *
+    (input.q_rest - input.q_measured);
 
   for (int i = 0; i < kSingleArmDof; ++i) {
     const double q_min = input.q_min[i];

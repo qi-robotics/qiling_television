@@ -8,6 +8,9 @@ qiling_o6_command_adapter:
     open_position: [255, 104, 255, 255, 255, 255]
     close_position: [101, 60, 0, 0, 0, 0]
     speed: 200
+    # Reassert the active target while the IK status is live. A single DDS
+    # sample does not prove that the O6 controller accepted the command.
+    command_refresh_hz: 10.0
     # Inverse-normalized from the original 0..100 action hand positions.
     gesture_shake_right_position: [115, 115, 204, 204, 204, 204]
     gesture_baoquan_right_position: [102, 102, 0, 0, 0, 0]

@@ -85,24 +85,51 @@ right: [1.0, -1.2, 0, -1.2, 0, 0, 0]
 ```
 
 `home_state` 数值为：`0=WAITING_FOR_STATE`、`1=MOVING`、`2=SETTLING`、
-`3=READY`、`4=FAULT`、`5=HOLD_FOR_RECORDING`。录制器在 episode 成功/失败后调用
-`/teleop/request_recording_hold` 锁存当前实测姿态，再调用 `/teleop/request_home`；
-后一个请求从当前实测姿态直接五次多项式插值到 home，不使用启动阶段的过渡点。
+`3=READY`、`4=FAULT`（包括恢复故障）、`5=HOLD_FOR_RECORDING`。
+`/teleop/request_home` 与 Y+A 共用回 home 恢复流程，可在遥操、动作、
+启动回 home 及故障保持阶段请求；反馈暂时失联时先记录请求，收到双臂新鲜状态后
+再规划。`/teleop/request_recording_hold` 仍可单独用于锁存命令。
 
 O6 状态节点在收到该话题为 `true` 之前强制输出零状态，因此 home 期间不会
 因手柄输入改变 O6 状态。O6 仍然是独立于 26 维双臂命令的接口。
 
 ## 组合动作（默认启用）
 
-已接入挥手、握手、抱拳的关节空间动作状态机，
+已接入挥手、握手、抱拳和双臂回零位的关节空间动作状态机，
 `config/differential_ik.yaml` 中 `gesture_enabled: true`；启动并完成 home 后
-无需再手动设置参数。挥手、握手、抱拳分别使用 X+A、Y+B、X+B；
-Y+A 使双臂从当前命令构型平滑回 home。组合键均需两侧 Grip/Trigger
-松开；执行期间两侧遥操和 Trigger 手型输入均锁定。动作从当前命令平滑进场，
-结束后直接回 home，到位并交接后才重新接受控制。抱拳右手闭合与回程张开
-各发送三次，后两次间隔约 0.1 秒。离线轨迹与碰撞检查范围
+无需再手动设置参数。挥手、握手、抱拳、双臂回零位分别使用 X+A、Y+B、X+B、A+B；
+Y+A 使双臂从当前命令构型平滑回 home。三个表演动作及 A+B 需要两侧 Grip/Trigger
+松开；Y+A 可在 Grip/Trigger 按住时请求，松开并再次按下 Y+A 才会再次触发。
+执行期间两侧遥操和 Trigger 手型输入均锁定。若起点关节在 URDF 硬限位内、
+但不足 `0.12 rad` 软件余量，进场阶段先把该关节平滑移入余量；未设动作目标的
+另一臂只调整这些近限位关节。动作从当前命令平滑进场，
+三个表演动作结束后回 home；A+B 到达双臂关节零位后保持零位。到位并交接后
+才重新接受控制。A+B 使双手张开；Y+A 可从零位回 home。手型目标以 10 Hz
+重发，动作与遥操均共用此机制。离线轨迹与碰撞检查范围
 见 [第一阶段说明](docs/gesture_stage1_offline.md)，状态机、手型仲裁及启用前提见
 [第二阶段说明](docs/gesture_stage2_integration.md)。
+
+## 遥操目标与回 home 恢复
+
+Grip 接合后，IK 使用**上一帧命令构型**计算手端位姿与雅可比，并在该构型上
+积分关节速度；实测关节用于跟踪误差、硬限位、预测停止和重力计算。Quest 的
+相邻位姿增量经过速度、姿态超前量和关节跟踪误差限制；超出的手柄运动被丢弃，
+不会在机器人后面排队形成突然追赶。位置任务含弱 home 姿态偏好，腕姿态与肘部
+任务仍按现有层级求解。`tracking_stop_rad` 与 `tracking_hold_timeout_sec`
+触发保护保持时，保留最后命令构型，等待 Y+A 恢复。
+
+Y+A 和 `/teleop/request_home` 先保持最后发布的双臂命令，后台检查轨迹：
+**最后命令 → 当前反馈 → home**；若直达路径碰撞检查失败，再检查
+**最后命令 → 当前反馈 → 关节零位 → home**。轨迹采用关节限速、限加速度
+的五次插值，运行时检查反馈跟踪，到位后平滑交接，并要求重新松开 Grip 才能
+进入遥操。预检失败、反馈丢失或到位超时会保持命令并报告故障；可再次按 Y+A
+重试。碰撞检查只覆盖 URDF 中的机器人本体，无法感知桌面、人员等外部障碍。
+回 home 必须有双臂新鲜反馈及至少一条通过检查的路径，故障时不会盲目运动。
+
+相关参数在 `config/differential_ik.yaml`：`target_max_position_lead_m`、
+`target_max_orientation_lead_rad`、`tracking_slowdown_start_rad`、
+`tracking_stop_rad`、`recovery_tracking_tolerance_rad` 等。修改参数后重启节点；
+修改 C++ 后重新运行 `./src/scripts/build_xrtele.sh`。
 
 启动文件包含：
 
@@ -122,9 +149,10 @@ O6 内部状态话题为：
 ```
 
 其中 bit 0 表示左 O6 闭合，bit 1 表示右 O6 闭合。Trigger 按住时对应 bit
-置位，释放后清零。`o6_command_adapter_node` 只在状态发生变化时向
-`/handscmd` 发送一次双手命令；Quest 输入超时期间，Trigger 状态节点保持
-最后稳定状态，适配器因此保持最后一个手部目标位置。
+置位，释放后清零。`o6_command_adapter_node` 在状态变化时立即发送双手命令，
+并在 IK 状态新鲜且 home 已完成时以 10 Hz 重发当前目标。动作结束后每只手
+分别在其 Trigger 松开后重新使能，不要求两侧同时松开。Quest 输入超时期间，
+Trigger 状态节点保持最后稳定状态，适配器因此保持最后一个手部目标位置。
 
 `/xr/controller_joy` 的实体按键索引为：左 X=`buttons[0]`、右 A=`buttons[1]`、
 左 Y=`buttons[2]`、右 B=`buttons[3]`，左右 Grip 分别为 `buttons[4]` 和

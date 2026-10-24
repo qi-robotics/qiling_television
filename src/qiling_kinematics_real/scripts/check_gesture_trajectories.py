@@ -160,11 +160,23 @@ def parse_start(values, home):
 def validate_action(name, spec, start, home, order, mapping, model, geom,
                     lower, upper, velocity, acceleration, margin, factor):
     target = {side: vector(home[side] if name == "home" else
+                           np.zeros(7) if name == "zero" else
                            spec.get(f"{side}_target", start[side]), 7,
                            f"{name} {side} target") for side in SIDES}
+    for side in SIDES:
+        if name not in ("home", "zero") and f"{side}_target" not in spec:
+            target[side] = np.clip(target[side], lower[side] + margin,
+                                   upper[side] - margin)
+        if np.any(start[side] < lower[side] - 1e-9) or \
+                np.any(start[side] > upper[side] + 1e-9):
+            raise ValueError(f"{name} {side} start outside URDF hard limit")
+        if np.any(target[side] < lower[side] + margin - 1e-9) or \
+                np.any(target[side] > upper[side] - margin + 1e-9):
+            raise ValueError(f"{name} {side} target outside soft limit")
+    end = target if name == "zero" else home
     segments = (("entry", start, target),
                 ("motion", target, target),
-                ("return", target, home))
+                ("return", target, end))
     data = model.createData()
     geom_data = geom.createData()
     q = pin.neutral(model)
@@ -184,7 +196,7 @@ def validate_action(name, spec, start, home, order, mapping, model, geom,
                 clearance = np.minimum(values - lower[side], upper[side] - values)
                 smallest = float(np.min(clearance))
                 min_clearance = min(min_clearance, smallest)
-                required_clearance = 0.0 if name == "home" and kind == "entry" else margin
+                required_clearance = 0.0 if kind == "entry" else margin
                 if smallest < required_clearance - 1e-9:
                     joint = order[int(np.argmin(clearance))]
                     raise ValueError(f"{name} {kind} t={total_time + frame * STEP:.2f}s: "
@@ -219,7 +231,7 @@ def validate_action(name, spec, start, home, order, mapping, model, geom,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--action", choices=("wave", "shake", "baoquan", "home"))
+    parser.add_argument("--action", choices=("wave", "shake", "baoquan", "home", "zero"))
     parser.add_argument("--motor-positions", help="26 comma-separated read-only motor positions; default: configured home")
     args = parser.parse_args()
     settings = yaml.safe_load(GESTURES.read_text())

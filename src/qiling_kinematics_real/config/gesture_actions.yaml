@@ -10,10 +10,17 @@ joint_order:
   - wrist_pitch
   - wrist_yaw
 motor_offsets: {left: 12, right: 19}
+# Required at the action pose and during motion/return. Entry may start
+# closer to a hard limit and moves monotonically into this soft range.
 minimum_limit_clearance_rad: 0.12
 duration_safety_factor: 1.05
 actions:
   home:
+    entry_min_sec: 3.0
+    motion_min_sec: 0.02
+    return_min_sec: 0.02
+    motion_cycles: 1.0
+  zero:
     entry_min_sec: 3.0
     motion_min_sec: 0.02
     return_min_sec: 0.02

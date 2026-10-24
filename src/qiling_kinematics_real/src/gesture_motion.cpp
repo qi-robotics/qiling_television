@@ -1,8 +1,13 @@
 #include "qiling_kinematics/gesture_motion.hpp"
+#include "qiling_kinematics/recovery_home_plan.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -96,6 +101,7 @@ const char * gestureName(GestureKind kind)
     case GestureKind::Shake: return "shake";
     case GestureKind::Baoquan: return "baoquan";
     case GestureKind::Home: return "home";
+    case GestureKind::Zero: return "zero";
   }
   return "unknown";
 }
@@ -136,12 +142,26 @@ GesturePlan GesturePlan::load(
   if (kind == GestureKind::Home) {
     // A home chord moves directly from the last published arm command to home.
     plan.target_ = home;
+  } else if (kind == GestureKind::Zero) {
+    plan.target_ = {ArmVector::Zero(), ArmVector::Zero()};
+    plan.home_ = plan.target_;
   }
   plan.lower_ = lower;
   plan.upper_ = upper;
   plan.speed_limit_ = speed_limit;
   plan.acceleration_limit_ = acceleration_limit;
   plan.margin_ = readPositive(root["minimum_limit_clearance_rad"], "minimum_limit_clearance_rad");
+  for (int side = 0; side < 2; ++side) {
+    for (int joint = 0; joint < kSingleArmDof; ++joint) {
+      if (!std::isfinite(plan.lower_[side][joint]) ||
+        !std::isfinite(plan.upper_[side][joint]) ||
+        plan.lower_[side][joint] + plan.margin_ >
+        plan.upper_[side][joint] - plan.margin_)
+      {
+        throw std::runtime_error("gesture soft limit has no valid interior");
+      }
+    }
+  }
   plan.safety_factor_ = readPositive(root["duration_safety_factor"], "duration_safety_factor");
   if (plan.safety_factor_ < 1.0) {
     throw std::runtime_error("duration_safety_factor must be >= 1");
@@ -152,6 +172,16 @@ GesturePlan GesturePlan::load(
     const YAML::Node target_node = spec[std::string(side_name) + "_target"];
     if (target_node) {
       plan.target_[side] = readArm(target_node, std::string(side_name) + "_target");
+    } else if (kind != GestureKind::Home && kind != GestureKind::Zero) {
+      // An arm without an explicit action pose normally holds its start pose.
+      // If it starts close to a hard limit, move only those joints into the
+      // configured soft range during entry before holding them for the motion.
+      for (int joint = 0; joint < kSingleArmDof; ++joint) {
+        plan.target_[side][joint] = std::clamp(
+          plan.start_[side][joint],
+          plan.lower_[side][joint] + plan.margin_,
+          plan.upper_[side][joint] - plan.margin_);
+      }
     }
     const YAML::Node oscillation = spec[std::string(side_name) + "_oscillation"];
     if (oscillation) {
@@ -189,6 +219,27 @@ GesturePlan GesturePlan::load(
     (speed_limit.array() <= 0).any() || (acceleration_limit.array() <= 0).any())
   {
     throw std::runtime_error("gesture velocity/acceleration limits must be positive");
+  }
+  for (int side = 0; side < 2; ++side) {
+    for (int joint = 0; joint < kSingleArmDof; ++joint) {
+      const double start_value = plan.start_[side][joint];
+      const double target_value = plan.target_[side][joint];
+      if (!std::isfinite(start_value) ||
+        start_value < plan.lower_[side][joint] - 1e-9 ||
+        start_value > plan.upper_[side][joint] + 1e-9)
+      {
+        throw std::runtime_error(
+                std::string("gesture start outside URDF hard limit: ") +
+                (side == kLeft ? "left " : "right ") + kJointParts[joint]);
+      }
+      if (target_value < plan.lower_[side][joint] + plan.margin_ - 1e-9 ||
+        target_value > plan.upper_[side][joint] - plan.margin_ + 1e-9)
+      {
+        throw std::runtime_error(
+                std::string("gesture target outside soft limit: ") +
+                (side == kLeft ? "left " : "right ") + kJointParts[joint]);
+      }
+    }
   }
   plan.durations_[0] = plan.retimedDuration(
     GesturePhase::Entry, readPositive(spec["entry_min_sec"], "entry_min_sec"));
@@ -296,12 +347,11 @@ void GesturePlan::validate() const
       }
       for (int joint = 0; joint < kSingleArmDof; ++joint) {
         const double value = frame.position[side][joint];
-        // Home may start inside the configured soft clearance. Its quintic
-        // entry moves monotonically from that in-range start toward a home
-        // position inside the clearance, so enforce the URDF hard range until
-        // the entry has reached home. All other phases/actions retain margin_.
+        // Entry moves monotonically from a hard-limit-valid start to a target
+        // inside the soft range. Enforce the hard range during this transition;
+        // motion and return continue to require the full soft clearance.
         const double clearance =
-          kind_ == GestureKind::Home && frame.phase == GesturePhase::Entry ? 0.0 : margin_;
+          frame.phase == GesturePhase::Entry ? 0.0 : margin_;
         if (value < lower_[side][joint] + clearance - 1e-9 ||
           value > upper_[side][joint] - clearance + 1e-9 ||
           std::abs(frame.velocity[side][joint]) > speed_limit_[joint] + 1e-9 ||
@@ -360,15 +410,17 @@ double GesturePlan::totalDuration() const
   return durations_[0] + grip_wait_sec_ + durations_[1] + durations_[2];
 }
 
-std::string checkGestureCollisions(
-  const GesturePlan & plan,
-  const std::filesystem::path & urdf_path,
-  const std::filesystem::path & package_parent)
+struct CollisionGeometry
 {
-  try {
-    pinocchio::Model model;
+  pinocchio::Model model;
+  pinocchio::GeometryModel geom;
+  std::array<std::array<int, kSingleArmDof>, 2> q_index{};
+
+  CollisionGeometry(
+    const std::filesystem::path & urdf_path,
+    const std::filesystem::path & package_parent)
+  {
     pinocchio::urdf::buildModel(urdf_path.string(), model);
-    pinocchio::GeometryModel geom;
     pinocchio::urdf::buildGeom(
       model, urdf_path.string(), pinocchio::COLLISION, geom,
       std::vector<std::string>{package_parent.string()});
@@ -383,14 +435,14 @@ std::string checkGestureCollisions(
       for (int side = 0; side < 2; ++side) {
         if (isArmLink(name, side == kLeft ? "left" : "right")) {
           if (counts[side] >= 8) {
-            return "unexpected duplicate arm collision mesh";
+            throw std::runtime_error("unexpected duplicate arm collision mesh");
           }
           arm_geom[side][counts[side]++] = static_cast<int>(i);
         }
       }
     }
     if (counts[kLeft] != 8 || counts[kRight] != 8 || fixed_geom.empty()) {
-      return "missing expected arm or fixed-body collision mesh";
+      throw std::runtime_error("missing expected arm or fixed-body collision mesh");
     }
     for (int side = 0; side < 2; ++side) {
       for (int first = 0; first < 8; ++first) {
@@ -411,45 +463,142 @@ std::string checkGestureCollisions(
         geom.addCollisionPair(pinocchio::CollisionPair(left, right));
       }
     }
-    std::array<std::array<int, kSingleArmDof>, 2> q_index{};
     for (int side = 0; side < 2; ++side) {
       const char * name = side == kLeft ? "left" : "right";
       for (int joint = 0; joint < kSingleArmDof; ++joint) {
         const auto joint_id = model.getJointId(std::string(name) + "_" + kJointParts[joint] + "_joint");
         if (joint_id == 0 || model.nqs[joint_id] != 1) {
-          return "URDF joint mapping mismatch during collision preflight";
+          throw std::runtime_error("URDF joint mapping mismatch during collision preflight");
         }
         q_index[side][joint] = model.idx_qs[joint_id];
       }
     }
+  }
+};
+
+static std::shared_ptr<const CollisionGeometry> collisionGeometry(
+  const std::filesystem::path & urdf_path,
+  const std::filesystem::path & package_parent)
+{
+  static std::mutex mutex;
+  static std::map<std::string, std::shared_ptr<const CollisionGeometry>> cache;
+  const std::string key = urdf_path.string() + "|" + package_parent.string();
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto found = cache.find(key);
+  if (found != cache.end()) {
+    return found->second;
+  }
+  auto loaded = std::make_shared<CollisionGeometry>(urdf_path, package_parent);
+  cache.emplace(key, loaded);
+  return loaded;
+}
+
+std::string prewarmArmCollisionGeometry(
+  const std::filesystem::path & urdf_path,
+  const std::filesystem::path & package_parent)
+{
+  try {
+    collisionGeometry(urdf_path, package_parent);
+    return {};
+  } catch (const std::exception & error) {
+    return error.what();
+  }
+}
+
+static std::string checkTrajectoryCollisions(
+  double duration,
+  const std::function<std::array<ArmVector, 2>(double)> & sample,
+  const std::filesystem::path & urdf_path,
+  const std::filesystem::path & package_parent)
+{
+  try {
+    const auto geometry = collisionGeometry(urdf_path, package_parent);
+    const auto & model = geometry->model;
+    const auto & geom = geometry->geom;
+    const auto & q_index = geometry->q_index;
     pinocchio::Data data(model);
     pinocchio::GeometryData geom_data(geom);
     Eigen::VectorXd q = pinocchio::neutral(model);
-    for (double t = 0.0; t <= plan.totalDuration() + 1e-9; t += kStep) {
-      const auto frame = plan.sample(t);
+    std::vector<double> initial_penetration(geom.collisionPairs.size(), 0.0);
+    std::vector<bool> initially_colliding(geom.collisionPairs.size(), false);
+    std::vector<bool> cleared(geom.collisionPairs.size(), false);
+    for (double t = 0.0; t <= duration + 1e-9; t += kStep) {
+      const auto positions = sample(t);
       for (int side = 0; side < 2; ++side) {
         for (int joint = 0; joint < kSingleArmDof; ++joint) {
-          q[q_index[side][joint]] = frame.position[side][joint];
+          q[q_index[side][joint]] = positions[side][joint];
         }
       }
-      if (pinocchio::computeCollisions(model, data, geom, geom_data, q, true)) {
-        for (std::size_t pair_id = 0; pair_id < geom.collisionPairs.size(); ++pair_id) {
-          if (geom_data.collisionResults[pair_id].isCollision()) {
-            const auto & pair = geom.collisionPairs[pair_id];
-            std::ostringstream out;
-            out << "t=" << t << " collision "
-                << geom.geometryObjects[pair.first].name << " / "
-                << geom.geometryObjects[pair.second].name;
-            return out.str();
+      pinocchio::computeCollisions(model, data, geom, geom_data, q, false);
+      for (std::size_t pair_id = 0; pair_id < geom.collisionPairs.size(); ++pair_id) {
+        const auto & collision = geom_data.collisionResults[pair_id];
+        if (!collision.isCollision()) {
+          if (initially_colliding[pair_id]) {
+            cleared[pair_id] = true;
           }
+          continue;
         }
-        return "collision detected with unknown pair";
+        const auto & contacts = collision.getContacts();
+        if (contacts.empty()) {
+          return "collision depth unavailable";
+        }
+        double depth = 0.0;
+        for (const auto & contact : contacts) {
+          depth = std::max(depth, static_cast<double>(contact.penetration_depth));
+        }
+        if (!std::isfinite(depth)) {
+          return "non-finite collision depth";
+        }
+        if (t == 0.0) {
+          initial_penetration[pair_id] = depth;
+          initially_colliding[pair_id] = true;
+          continue;
+        }
+        // A recorded real state can already overlap conservative URDF meshes.
+        // Permit only the same pair while it clears; reject any new pair or
+        // increased penetration. This is a bounded escape, not permission to
+        // drive farther through the modelled body.
+        if (!initially_colliding[pair_id] || cleared[pair_id] ||
+          depth > initial_penetration[pair_id] + 0.002)
+        {
+          const auto & pair = geom.collisionPairs[pair_id];
+          std::ostringstream out;
+          out << "t=" << t << " collision "
+              << geom.geometryObjects[pair.first].name << " / "
+              << geom.geometryObjects[pair.second].name << " depth=" << depth;
+          return out.str();
+        }
+      }
+    }
+    for (std::size_t pair_id = 0; pair_id < geom.collisionPairs.size(); ++pair_id) {
+      if (initially_colliding[pair_id] && !cleared[pair_id]) {
+        return "existing collision did not clear along recovery path";
       }
     }
     return {};
   } catch (const std::exception & error) {
     return std::string("collision preflight unavailable: ") + error.what();
   }
+}
+
+std::string checkGestureCollisions(
+  const GesturePlan & plan,
+  const std::filesystem::path & urdf_path,
+  const std::filesystem::path & package_parent)
+{
+  return checkTrajectoryCollisions(
+    plan.totalDuration(), [&plan](double t) {return plan.sample(t).position;},
+    urdf_path, package_parent);
+}
+
+std::string checkRecoveryHomeCollisions(
+  const RecoveryHomePlan & plan,
+  const std::filesystem::path & urdf_path,
+  const std::filesystem::path & package_parent)
+{
+  return checkTrajectoryCollisions(
+    plan.totalDuration(), [&plan](double t) {return plan.sample(t).position;},
+    urdf_path, package_parent);
 }
 
 }  // namespace qiling_kinematics

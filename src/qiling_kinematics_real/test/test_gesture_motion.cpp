@@ -69,11 +69,30 @@ TEST(GestureMotion, ThreeActionsReturnHomeWithoutBoundaryJumps)
   }
 }
 
-TEST(GestureMotion, RejectsStartingOutsideSafetyMargin)
+TEST(GestureMotion, RejectsStartingOutsideUrdfHardLimit)
 {
   Arms unsafe = home();
   unsafe[1][0] = -3.0;
   EXPECT_THROW(loadPlan(GestureKind::Wave, unsafe), std::runtime_error);
+}
+
+TEST(GestureMotion, NearLimitHeldPoseEntersSoftRangeBeforeEachShowAction)
+{
+  Arms start = home();
+  // Last published command at two real NX gesture rejections.
+  start[0][3] = -1.93614;  // Left elbow: 0.071 rad above the URDF hard limit.
+  start[1][5] = -0.725538;  // Right wrist pitch: 0.059 rad above the hard limit.
+  for (GestureKind kind : {GestureKind::Wave, GestureKind::Shake, GestureKind::Baoquan}) {
+    const auto plan = loadPlan(kind, start);
+    const auto initial = plan.sample(0.0);
+    const auto entered = plan.sample(plan.segmentDurations()[0]);
+    EXPECT_NEAR(initial.position[0][3], start[0][3], 1e-9);
+    EXPECT_NEAR(initial.position[1][5], start[1][5], 1e-9);
+    EXPECT_GE(entered.position[0][3], -2.007 + 0.12 - 1e-9);
+    EXPECT_GE(entered.position[1][5], -0.785 + 0.12 - 1e-9);
+    EXPECT_TRUE(checkGestureCollisions(plan, kUrdf, kRoot / "src").empty()) <<
+      gestureName(kind);
+  }
 }
 
 TEST(GestureMotion, HomeMovesInwardFromNearRightElbowLimit)
@@ -97,6 +116,18 @@ TEST(GestureMotion, HomeRejectsStartOutsideUrdfHardLimit)
   Arms start = home();
   start[1][3] = -2.10;
   EXPECT_THROW(loadPlan(GestureKind::Home, start), std::runtime_error);
+}
+
+TEST(GestureMotion, ZeroMovesBothArmsFromHomeAndStaysAtZero)
+{
+  const auto plan = loadPlan(GestureKind::Zero, home());
+  EXPECT_GE(plan.segmentDurations()[0], 3.0);
+  for (int side = 0; side < 2; ++side) {
+    EXPECT_LT((plan.sample(0.0).position[side] - home()[side]).norm(), 1e-10);
+    EXPECT_LT(plan.sample(plan.totalDuration()).position[side].norm(), 1e-10);
+    EXPECT_LT(plan.endPose()[side].norm(), 1e-10);
+  }
+  EXPECT_TRUE(checkGestureCollisions(plan, kUrdf, kRoot / "src").empty());
 }
 
 TEST(GestureMotion, WaveHasCollisionFreeModelPreflightAtConfiguredHome)

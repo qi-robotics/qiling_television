@@ -34,6 +34,8 @@ public:
     double position_singularity_speed_scale_min{0.0};
     double position_regularization{1.0e-4};
     double position_smoothness_weight{1.0e-3};
+    double position_posture_weight{0.0};
+    double position_posture_gain{0.50};
     double max_angular_velocity{0.80};
     double orientation_error_deadband{0.0};
     double wrist_sigma_slowdown_start{0.08};
@@ -89,6 +91,7 @@ public:
     ArmLinearJacobian jacobian{ArmLinearJacobian::Zero()};
     Eigen::Vector3d position_error{Eigen::Vector3d::Zero()};
     ArmVector q_measured{ArmVector::Zero()};
+    ArmVector q_rest{ArmVector::Zero()};
     ArmVector q_min{ArmVector::Zero()};
     ArmVector q_max{ArmVector::Zero()};
     ArmVector qdot_previous{ArmVector::Zero()};

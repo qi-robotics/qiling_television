@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,8 @@
 #include "qiling_kinematics/ik_diagnostics.hpp"
 #include "qiling_kinematics/ik_types.hpp"
 #include "qiling_kinematics/near_limit_guard.hpp"
+#include "qiling_kinematics/recovery_home_plan.hpp"
+#include "qiling_kinematics/servo_target_governor.hpp"
 
 namespace
 {
@@ -73,6 +76,9 @@ using qiling_kinematics::GestureKind;
 using qiling_kinematics::GesturePhase;
 using qiling_kinematics::GesturePlan;
 using qiling_kinematics::GestureStatus;
+using qiling_kinematics::RecoveryHomePlan;
+using qiling_kinematics::ServoTargetGovernor;
+using qiling_kinematics::ServoTargetGovernorConfig;
 using qiling_kinematics::HierarchicalDIKSolver;
 using qiling_kinematics::IkDiagnostics;
 using qiling_kinematics::SolverStatus;
@@ -88,9 +94,17 @@ struct TimedTarget
 struct WorkspaceGuardState
 {
   double bad_duration_sec{0.0};
+  double tracking_bad_duration_sec{0.0};
+};
+
+struct RecoveryPreflightResult
+{
+  std::optional<RecoveryHomePlan> plan;
+  std::string reason;
 };
 
 enum class GestureRunPhase {Idle, Running, Settling, Handoff, Fault};
+enum class RecoveryRunPhase {Idle, Preflight, Running, Settling, Handoff, Fault};
 
 enum class StartupHomePhase
 {
@@ -102,6 +116,7 @@ enum class StartupHomePhase
   TransitionToTeleop,
   HoldForRecording,
   MoveDirectToHome,
+  RecoveryFault,
   Complete,
   Fault,
 };
@@ -125,6 +140,8 @@ const char * toString(StartupHomePhase phase)
       return "HOLD_FOR_RECORDING";
     case StartupHomePhase::MoveDirectToHome:
       return "MOVE_DIRECT_TO_HOME";
+    case StartupHomePhase::RecoveryFault:
+      return "RECOVERY_FAULT";
     case StartupHomePhase::Complete:
       return "COMPLETE";
     case StartupHomePhase::Fault:
@@ -251,6 +268,13 @@ public:
   {
     declareParameters();
     loadModel();
+    const auto collision_urdf = urdf_path_;
+    const auto collision_root = urdf_path_.parent_path().parent_path().parent_path();
+    collision_warmup_ = std::async(std::launch::async,
+        [collision_urdf, collision_root]() {
+          return qiling_kinematics::prewarmArmCollisionGeometry(
+            collision_urdf, collision_root);
+        });
     validateLimitRecoveryParameters();
     configureSolvers();
 
@@ -351,18 +375,26 @@ private:
       "/config/gesture_actions.yaml");
     declare_parameter("gesture_joy_timeout_sec", 0.20);
     declare_parameter("gesture_chord_stable_sec", 0.15);
-    declare_parameter("gesture_start_tracking_tolerance_rad", 0.15);
+    declare_parameter("gesture_start_tracking_tolerance_rad", 0.30);
     declare_parameter("gesture_motion_tracking_tolerance_rad", 0.35);
     declare_parameter("gesture_home_tolerance_rad", 0.20);
     declare_parameter("gesture_home_settle_sec", 0.20);
     declare_parameter("gesture_home_settle_timeout_sec", 10.0);
     declare_parameter("gesture_handoff_sec", 0.75);
+    declare_parameter("recovery_tracking_tolerance_rad", 0.45);
+    declare_parameter("recovery_tracking_timeout_sec", 0.50);
 
     declare_parameter("target_timeout_sec", 0.25);
     declare_parameter("joint_state_timeout_sec", 0.20);
     declare_parameter("target_frame", std::string("base_link"));
     declare_parameter("target_filter_enabled", true);
     declare_parameter("target_filter_time_constant_sec", 0.04);
+    declare_parameter("target_max_position_lead_m", 0.08);
+    declare_parameter("target_max_orientation_lead_rad", 0.30);
+    declare_parameter("tracking_slowdown_start_rad", 0.10);
+    declare_parameter("tracking_stop_rad", 0.35);
+    declare_parameter("tracking_hold_timeout_sec", 0.30);
+    declare_parameter("left_wrist_yaw_tracking_guard_enabled", false);
     declare_parameter("workspace_guard_enabled", true);
     declare_parameter("workspace_guard_error_m", 0.03);
     declare_parameter("workspace_guard_timeout_sec", 0.25);
@@ -377,6 +409,8 @@ private:
     declare_parameter("position_singularity_speed_scale_min", 0.0);
     declare_parameter("position_regularization", 1.0e-4);
     declare_parameter("position_smoothness_weight", 1.0e-3);
+    declare_parameter("position_posture_weight", 0.002);
+    declare_parameter("position_posture_gain", 0.50);
     declare_parameter("rotation_gain", 3.0);
     declare_parameter("max_angular_velocity_rps", 0.80);
     declare_parameter("orientation_error_deadband_rad", 0.01);
@@ -546,6 +580,10 @@ private:
     config.position_regularization = get_parameter("position_regularization").as_double();
     config.position_smoothness_weight =
       get_parameter("position_smoothness_weight").as_double();
+    config.position_posture_weight =
+      get_parameter("position_posture_weight").as_double();
+    config.position_posture_gain =
+      get_parameter("position_posture_gain").as_double();
     config.rotation_gain = get_parameter("rotation_gain").as_double();
     config.max_angular_velocity = get_parameter("max_angular_velocity_rps").as_double();
     config.orientation_error_deadband =
@@ -663,6 +701,8 @@ private:
   {
     filtered_target_valid_[side] = false;
     workspace_guard_[side].bad_duration_sec = 0.0;
+    workspace_guard_[side].tracking_bad_duration_sec = 0.0;
+    target_governors_[side].reset();
   }
 
   void updateMeasuredVelocity(
@@ -1038,49 +1078,19 @@ private:
   void homeRequestService(
     const Trigger::Request::SharedPtr /*request*/, Trigger::Response::SharedPtr response)
   {
-    std::array<ArmVector, kSideCount> measured;
-    if (home_complete_ || home_phase_ != StartupHomePhase::HoldForRecording ||
-      !getFreshMeasuredArms(measured))
-    {
-      response->success = false;
-      response->message =
-        "home request rejected: robot is not holding a completed episode or feedback is stale";
-      RCLCPP_WARN(get_logger(), "%s", response->message.c_str());
-      return;
-    }
-
-    // Start from the command that was actually sent on the previous cycle.
-    // Starting from measured feedback would remove the existing Kp position
-    // error in one frame and create an actuator-torque step.
-    home_start_q_ = last_published_command_initialized_ ?
-      last_published_positions_ : home_command_q_;
-    if (!home_start_q_[kLeftSide].allFinite() ||
-      !home_start_q_[kRightSide].allFinite())
-    {
-      home_start_q_ = home_hold_target_q_;
-    }
-    if (!home_start_q_[kLeftSide].allFinite() ||
-      !home_start_q_[kRightSide].allFinite())
-    {
-      response->success = false;
-      response->message = "home request rejected: no finite held arm command";
-      RCLCPP_ERROR(get_logger(), "%s", response->message.c_str());
-      return;
-    }
-    home_command_q_ = home_start_q_;
-    for (auto & velocity : home_command_qdot_) {
-      velocity.setZero();
-    }
-    // Fade gravity feedforward over the complete direct-home trajectory. The
-    // position trajectory and effort transition therefore share the same
-    // quintic duration instead of removing several N.m in the first 0.5 s.
-    beginGravityBlend(
-      0.0, std::max(get_parameter("home_move_duration_sec").as_double(), 0.1));
-    teleop_side_ready_.fill(false);
-    setHomePhase(StartupHomePhase::MoveDirectToHome, "direct home requested");
-
     response->success = true;
-    response->message = "direct held-command to home interpolation started";
+    if (recovery_phase_ == RecoveryRunPhase::Preflight ||
+      recovery_phase_ == RecoveryRunPhase::Running ||
+      recovery_phase_ == RecoveryRunPhase::Settling ||
+      recovery_phase_ == RecoveryRunPhase::Handoff)
+    {
+      response->message = "home recovery already in progress";
+      return;
+    }
+    // The control loop owns the command publisher and starts the same
+    // collision-checked recovery as Y+A when both state streams are fresh.
+    recovery_pending_ = true;
+    response->message = "home recovery queued; waiting for fresh arm feedback";
     RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
   }
 
@@ -1093,6 +1103,29 @@ private:
       result = std::max(result, (measured[side] - target[side]).cwiseAbs().maxCoeff());
     }
     return result;
+  }
+
+  double armTrackingError(
+    int side, const ArmVector & measured, const ArmVector & reference) const
+  {
+    ArmVector joint_errors = (measured - reference).cwiseAbs();
+    if (side == kLeftSide &&
+      !get_parameter("left_wrist_yaw_tracking_guard_enabled").as_bool())
+    {
+      // Keep the left wrist yaw in the IK and command path, but by default do
+      // not let its feedback mismatch throttle or stop the whole left arm.
+      joint_errors[kSingleArmDof - 1] = 0.0;
+    }
+    return joint_errors.maxCoeff();
+  }
+
+  double maxArmTrackingError(
+    const std::array<ArmVector, kSideCount> & measured,
+    const std::array<ArmVector, kSideCount> & reference) const
+  {
+    return std::max(
+      armTrackingError(kLeftSide, measured[kLeftSide], reference[kLeftSide]),
+      armTrackingError(kRightSide, measured[kRightSide], reference[kRightSide]));
   }
 
   static void quinticSegment(
@@ -1137,6 +1170,7 @@ private:
         state.data = 3;
         break;
       case StartupHomePhase::Fault:
+      case StartupHomePhase::RecoveryFault:
         state.data = 4;
         break;
       case StartupHomePhase::HoldForRecording:
@@ -1152,7 +1186,8 @@ private:
     home_phase_time_sec_ = 0.0;
     home_settle_time_sec_ = 0.0;
     if (phase != StartupHomePhase::Complete && phase != StartupHomePhase::HoldForRecording &&
-      phase != StartupHomePhase::MoveDirectToHome)
+      phase != StartupHomePhase::MoveDirectToHome &&
+      phase != StartupHomePhase::RecoveryFault)
     {
       resetGravityBlend();
     }
@@ -1417,6 +1452,7 @@ private:
       case StartupHomePhase::WaitingForState:
       case StartupHomePhase::Complete:
       case StartupHomePhase::Fault:
+      case StartupHomePhase::RecoveryFault:
         home_command_q_ =
           home_phase_ == StartupHomePhase::Fault ? measured : home_q_;
         for (auto & velocity : home_command_qdot_) {
@@ -1465,7 +1501,7 @@ private:
       // becomes stale. Replacing it with the last measured value could put an
       // already-out-of-range position straight back into the command.
       if (!control.recovering()) {
-        control.enterHold(measured, requested_active, "JointState timeout");
+        control.enterProtectiveHold(requested_active, "JointState timeout");
       }
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
@@ -1527,11 +1563,13 @@ private:
     }
 
     if (measured_outside) {
-      // Never use the out-of-range feedback value as a position command. The
-      // first recovery command is clamped to the exact URDF boundary and all
-      // subsequent references move toward the interior recovery target.
+      // Keep the last bounded command as the first recovery command. Copying
+      // even a clamped measurement could create a large one-cycle position
+      // step when feedback has diverged from the reference.
+      const ArmVector initial_reference = clampToJointRange(
+        control.reference(), q_min, q_max);
       control.enterLimitRecovery(
-        clampToJointRange(measured, q_min, q_max), requested_active,
+        initial_reference, requested_active,
         "measured position outside URDF range; limit recovery");
       resetTargetAndGuard(side);
       elbow_geometry_[side].reset();
@@ -1606,7 +1644,7 @@ private:
     control.updateGripRequest(requested_active, measured);
 
     if (control_stalled) {
-      control.enterHold(measured, requested_active, "control loop stall");
+      control.enterProtectiveHold(requested_active, "control loop stall");
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
     }
@@ -1622,7 +1660,7 @@ private:
     const double target_timeout = get_parameter("target_timeout_sec").as_double();
     if (!target.received || !std::isfinite(target_age) || target_age > target_timeout) {
       resetTargetAndGuard(side);
-      control.enterHold(measured, true, "target timeout");
+      control.enterProtectiveHold(true, "target timeout");
       finishArmCycle(side_name, previous_state, control, diagnostics);
       return;
     }
@@ -1632,7 +1670,50 @@ private:
       return;
     }
 
-    const TimedTarget control_target = filteredTarget(side, target, dt);
+    const double tracking_error = armTrackingError(side, measured, control.reference());
+    const double tracking_stop = get_parameter("tracking_stop_rad").as_double();
+    if (tracking_error >= tracking_stop) {
+      workspace_guard_[side].tracking_bad_duration_sec += dt;
+    } else {
+      workspace_guard_[side].tracking_bad_duration_sec = 0.0;
+    }
+    if (workspace_guard_[side].tracking_bad_duration_sec >=
+      get_parameter("tracking_hold_timeout_sec").as_double())
+    {
+      control.enterProtectiveHold(true, "command tracking divergence");
+      resetTargetAndGuard(side);
+      diagnostics.command_held = true;
+      finishArmCycle(side_name, previous_state, control, diagnostics);
+      RCLCPP_WARN(
+        get_logger(), "%s teleoperation held: command tracking error %.3f rad",
+        side_name, tracking_error);
+      return;
+    }
+
+    ServoTargetGovernorConfig governor_config;
+    governor_config.max_linear_velocity_mps =
+      get_parameter("max_linear_velocity_mps").as_double();
+    governor_config.max_angular_velocity_rps =
+      get_parameter("max_angular_velocity_rps").as_double();
+    governor_config.max_position_lead_m =
+      get_parameter("target_max_position_lead_m").as_double();
+    governor_config.max_orientation_lead_rad =
+      get_parameter("target_max_orientation_lead_rad").as_double();
+    governor_config.tracking_slowdown_start_rad =
+      get_parameter("tracking_slowdown_start_rad").as_double();
+    governor_config.tracking_stop_rad = tracking_stop;
+    Eigen::Isometry3d raw_pose = Eigen::Isometry3d::Identity();
+    raw_pose.linear() = target.pose.rotation();
+    raw_pose.translation() = target.pose.translation();
+    Eigen::Isometry3d wrist_pose = Eigen::Isometry3d::Identity();
+    wrist_pose.linear() = arm_kinematics.wrist_pose.rotation();
+    wrist_pose.translation() = arm_kinematics.wrist_pose.translation();
+    const Eigen::Isometry3d admitted = target_governors_[side].update(
+      raw_pose, wrist_pose, tracking_error, dt, governor_config);
+    TimedTarget governed_target = target;
+    governed_target.pose = pinocchio::SE3(
+      admitted.rotation(), admitted.translation());
+    const TimedTarget control_target = filteredTarget(side, governed_target, dt);
 
     const bool orientation_enabled = get_parameter("orientation_task_enabled").as_bool();
     const bool elbow_task_enabled =
@@ -1660,7 +1741,8 @@ private:
     position_input.jacobian = arm_kinematics.wrist_jacobian.topRows<3>();
     position_input.position_error =
       control_target.pose.translation() - arm_kinematics.wrist_pose.translation();
-    position_input.q_measured = measured;
+    position_input.q_measured = control.reference();
+    position_input.q_rest = home_q_[side];
     position_input.q_min = q_min_[side];
     position_input.q_max = q_max_[side];
     position_input.qdot_previous = control.previousVelocity();
@@ -1732,13 +1814,9 @@ private:
       return;
     }
 
-    if (side == kLeftSide &&
-      get_parameter("left_guarded_near_limit_regrip").as_bool())
-    {
-      result.qdot = qiling_kinematics::suppressOutwardVelocityNearLimit(
-        measured, result.qdot, q_min, q_max, active_entry_margin);
-      diagnostics.qdot = result.qdot;
-    }
+    result.qdot = qiling_kinematics::suppressOutwardVelocityNearLimit(
+      measured, result.qdot, q_min, q_max, active_entry_margin);
+    diagnostics.qdot = result.qdot;
 
     const bool guard_enabled = get_parameter("workspace_guard_enabled").as_bool();
     const double guard_error = get_parameter("workspace_guard_error_m").as_double();
@@ -1764,7 +1842,7 @@ private:
     if (guard_enabled && guard_parameters_valid &&
       workspace_guard_[side].bad_duration_sec >= guard_timeout)
     {
-      control.enterHold(measured, true, "unreachable target or workspace boundary");
+      control.enterProtectiveHold(true, "unreachable target or workspace boundary");
       diagnostics.qdot.setZero();
       diagnostics.command_held = true;
       finishArmCycle(side_name, previous_state, control, diagnostics);
@@ -1789,9 +1867,12 @@ private:
     }
     const double max_tracking_error =
       get_parameter("max_reference_tracking_error_rad").as_double();
+    const int tracking_exempt_joint = side == kLeftSide &&
+      !get_parameter("left_wrist_yaw_tracking_guard_enabled").as_bool() ?
+      kSingleArmDof - 1 : -1;
     if (!control.integrateReference(
         result.qdot, dt, measured, position_input.q_min, position_input.q_max,
-        max_tracking_error))
+        max_tracking_error, tracking_exempt_joint))
     {
       logReferenceIntegrationFailure(
         side, side_name, control, result.qdot, dt, measured,
@@ -1894,6 +1975,239 @@ private:
     gesture_status_pub_->publish(message);
   }
 
+  void recoveryFault(const std::string & reason)
+  {
+    recovery_phase_ = RecoveryRunPhase::Fault;
+    home_started_ = true;
+    home_complete_ = false;
+    recovery_command_qdot_ = {ArmVector::Zero(), ArmVector::Zero()};
+    gesture_hand_status_ = GestureStatus::Fault;
+    // Preserve the current position command and gravity support. A new Y+A
+    // can retry from this same published command after feedback is available.
+    setHomePhase(StartupHomePhase::RecoveryFault, "recovery stopped");
+    RCLCPP_ERROR(get_logger(), "home recovery stopped: %s", reason.c_str());
+    publishGestureStatus();
+  }
+
+  void requestRecoveryHome(
+    const std::array<ArmVector, kSideCount> & measured, bool replan = false)
+  {
+    if (recovery_preflight_.valid()) {
+      if (recovery_preflight_.wait_for(std::chrono::seconds(0)) !=
+        std::future_status::ready)
+      {
+        return;
+      }
+      recovery_preflight_.get();
+    }
+    const auto start = last_published_command_initialized_ ?
+      last_published_positions_ : measured;
+    recovery_command_q_ = start;
+    recovery_command_qdot_ = {ArmVector::Zero(), ArmVector::Zero()};
+    recovery_pending_ = false;
+    recovery_planned_measured_ = measured;
+    recovery_replans_ = replan ? recovery_replans_ + 1 : 0;
+    const auto lower = q_min_;
+    const auto upper = q_max_;
+    const auto home = home_q_;
+    const auto urdf = urdf_path_;
+    const auto package_parent = urdf_path_.parent_path().parent_path().parent_path();
+    const auto speed_values = get_parameter("max_joint_velocity_rps").as_double_array();
+    const auto acceleration_values =
+      get_parameter("max_joint_acceleration_rps2").as_double_array();
+    if (speed_values.size() != kSingleArmDof ||
+      acceleration_values.size() != kSingleArmDof)
+    {
+      recoveryFault("invalid joint rate limits");
+      return;
+    }
+    ArmVector speed;
+    ArmVector acceleration;
+    for (int joint = 0; joint < kSingleArmDof; ++joint) {
+      speed[joint] = speed_values[joint];
+      acceleration[joint] = acceleration_values[joint];
+    }
+
+    recovery_phase_ = RecoveryRunPhase::Preflight;
+    home_started_ = true;
+    home_complete_ = false;
+    setHomePhase(StartupHomePhase::MoveDirectToHome, "checking home recovery path");
+    recovery_plan_.reset();
+    gesture_run_phase_ = GestureRunPhase::Idle;
+    gesture_plan_.reset();
+    gesture_hand_status_ = GestureStatus::Preflight;
+    teleop_side_ready_.fill(false);
+    resetTargetAndGuard(kLeftSide);
+    resetTargetAndGuard(kRightSide);
+    left_control_.enterHold(measured[kLeftSide], true, "home recovery owns both arms");
+    right_control_.enterHold(measured[kRightSide], true, "home recovery owns both arms");
+    publishGestureStatus();
+    RCLCPP_INFO(get_logger(), "home recovery requested; checking direct and zero paths");
+
+    recovery_preflight_ = std::async(std::launch::async,
+        [start, measured, home, lower, upper, speed, acceleration, urdf,
+        package_parent]() -> RecoveryPreflightResult {
+          RecoveryPreflightResult result;
+          try {
+            auto direct = RecoveryHomePlan::create(
+              start, measured, home, lower, upper, speed, acceleration, false);
+            const std::string direct_error = qiling_kinematics::checkRecoveryHomeCollisions(
+              direct, urdf, package_parent);
+            if (direct_error.empty()) {
+              result.plan = std::move(direct);
+              return result;
+            }
+            auto via_zero = RecoveryHomePlan::create(
+              start, measured, home, lower, upper, speed, acceleration, true);
+            const std::string zero_error = qiling_kinematics::checkRecoveryHomeCollisions(
+              via_zero, urdf, package_parent);
+            if (zero_error.empty()) {
+              result.plan = std::move(via_zero);
+              return result;
+            }
+            result.reason = "direct path: " + direct_error + "; zero path: " + zero_error;
+          } catch (const std::exception & error) {
+            result.reason = error.what();
+          }
+          return result;
+        });
+  }
+
+  bool runRecoveryHome(
+    const std::array<ArmVector, kSideCount> & measured,
+    bool left_fresh, bool right_fresh, bool control_stalled, double dt)
+  {
+    if (recovery_phase_ == RecoveryRunPhase::Idle) {
+      return false;
+    }
+    if (recovery_phase_ == RecoveryRunPhase::Fault) {
+      if (recovery_preflight_.valid() &&
+        recovery_preflight_.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready)
+      {
+        recovery_preflight_.get();
+      }
+      publishGestureStatus();
+      return true;
+    }
+    if (!left_fresh || !right_fresh || control_stalled) {
+      recoveryFault("feedback stale or control loop stalled");
+      return true;
+    }
+    if (recovery_phase_ == RecoveryRunPhase::Preflight) {
+      if (recovery_preflight_.wait_for(std::chrono::seconds(0)) !=
+        std::future_status::ready)
+      {
+        publishGestureStatus();
+        return true;
+      }
+      auto result = recovery_preflight_.get();
+      if (!result.plan) {
+        recoveryFault(result.reason);
+        return true;
+      }
+      if (maxJointError(measured, recovery_planned_measured_) > 0.10) {
+        if (recovery_replans_ >= 2) {
+          recoveryFault("feedback moved repeatedly during recovery preflight");
+        } else {
+          RCLCPP_WARN(get_logger(), "feedback moved during recovery preflight; replanning");
+          requestRecoveryHome(measured, true);
+        }
+        return true;
+      }
+      recovery_plan_ = std::move(result.plan);
+      recovery_elapsed_sec_ = 0.0;
+      recovery_phase_time_sec_ = 0.0;
+      recovery_settle_sec_ = 0.0;
+      recovery_bad_tracking_sec_ = 0.0;
+      home_started_ = true;
+      home_complete_ = false;
+      setHomePhase(StartupHomePhase::MoveDirectToHome, "validated recovery path");
+      beginGravityBlend(0.0, recovery_plan_->totalDuration());
+      gesture_hand_status_ = GestureStatus::ReturnOpen;
+      recovery_phase_ = RecoveryRunPhase::Running;
+      RCLCPP_INFO(
+        get_logger(), "home recovery path accepted: %s, duration %.2f s",
+        recovery_plan_->viaZero() ? "through zero" : "direct",
+        recovery_plan_->totalDuration());
+    }
+    if (recovery_phase_ == RecoveryRunPhase::Running) {
+      recovery_elapsed_sec_ += dt;
+      const auto frame = recovery_plan_->sample(recovery_elapsed_sec_);
+      recovery_command_q_ = frame.position;
+      recovery_command_qdot_ = frame.velocity;
+      if (recovery_elapsed_sec_ > recovery_plan_->reconcileDuration()) {
+        if (maxJointError(measured, recovery_command_q_) >
+          get_parameter("recovery_tracking_tolerance_rad").as_double())
+        {
+          recovery_bad_tracking_sec_ += dt;
+        } else {
+          recovery_bad_tracking_sec_ = 0.0;
+        }
+        if (recovery_bad_tracking_sec_ >
+          get_parameter("recovery_tracking_timeout_sec").as_double())
+        {
+          recoveryFault("joint feedback did not follow the recovery trajectory");
+          return true;
+        }
+      }
+      if (recovery_elapsed_sec_ >= recovery_plan_->totalDuration()) {
+        recovery_phase_ = RecoveryRunPhase::Settling;
+        recovery_phase_time_sec_ = 0.0;
+      }
+    } else if (recovery_phase_ == RecoveryRunPhase::Settling) {
+      recovery_phase_time_sec_ += dt;
+      recovery_command_q_ = home_q_;
+      recovery_command_qdot_ = {ArmVector::Zero(), ArmVector::Zero()};
+      if (maxJointError(measured, home_q_) <=
+        get_parameter("gesture_home_tolerance_rad").as_double())
+      {
+        recovery_settle_sec_ += dt;
+        if (recovery_settle_sec_ >=
+          get_parameter("gesture_home_settle_sec").as_double())
+        {
+          recovery_handoff_target_ = measured;
+          recovery_phase_ = RecoveryRunPhase::Handoff;
+          recovery_phase_time_sec_ = 0.0;
+        }
+      } else {
+        recovery_settle_sec_ = 0.0;
+      }
+      if (recovery_phase_time_sec_ >
+        get_parameter("gesture_home_settle_timeout_sec").as_double())
+      {
+        recoveryFault("home feedback did not settle");
+      }
+    } else if (recovery_phase_ == RecoveryRunPhase::Handoff) {
+      recovery_phase_time_sec_ += dt;
+      const double duration = std::max(
+        get_parameter("gesture_handoff_sec").as_double(), 0.02);
+      for (int side = 0; side < kSideCount; ++side) {
+        quinticSegment(
+          home_q_[side], recovery_handoff_target_[side], recovery_phase_time_sec_,
+          duration, recovery_command_q_[side], recovery_command_qdot_[side]);
+      }
+      if (recovery_phase_time_sec_ >= duration) {
+        left_control_.completeRecovery(recovery_handoff_target_[kLeftSide]);
+        right_control_.completeRecovery(recovery_handoff_target_[kRightSide]);
+        left_control_.updateGripRequest(false, measured[kLeftSide]);
+        right_control_.updateGripRequest(false, measured[kRightSide]);
+        home_complete_ = true;
+        setHomePhase(StartupHomePhase::Complete, "recovery home complete");
+        beginGravityBlend(
+          1.0, get_parameter("gravity_transition_duration_sec").as_double());
+        gesture_hand_status_ = GestureStatus::Idle;
+        gesture_chord_armed_ = false;
+        teleop_side_ready_.fill(false);
+        recovery_phase_ = RecoveryRunPhase::Idle;
+        recovery_plan_.reset();
+        RCLCPP_INFO(get_logger(), "home recovery complete; release both Grips to rearm");
+      }
+    }
+    publishGestureStatus();
+    return true;
+  }
+
   std::optional<GestureKind> pendingGestureChord(Clock::time_point now_steady)
   {
     JoyMsg joy;
@@ -1910,11 +2224,13 @@ private:
       joy.buttons.size() < 6 || joy.axes.size() < 4)
     {
       gesture_chord_candidate_ = 0;
+      home_chord_candidate_ = false;
       return std::nullopt;
     }
     for (int i = 0; i < 4; ++i) {
       if (!std::isfinite(joy.axes[i])) {
         gesture_chord_candidate_ = 0;
+        home_chord_candidate_ = false;
         return std::nullopt;
       }
     }
@@ -1922,6 +2238,24 @@ private:
     for (int i = 0; i < 4; ++i) {
       if (joy.buttons[i] != 0) {
         buttons |= static_cast<std::uint8_t>(1 << i);
+      }
+    }
+    // Home is the recovery action. It works while either Grip or Trigger is
+    // held, unlike the three voluntary gestures. Require a fresh Y+A edge so
+    // one long press cannot repeatedly restart a failed recovery.
+    if (buttons != 0x06) {
+      home_chord_armed_ = true;
+      home_chord_candidate_ = false;
+    } else if (home_chord_armed_) {
+      if (!home_chord_candidate_) {
+        home_chord_candidate_ = true;
+        home_chord_since_ = now_steady;
+      } else if (ageSeconds(now_steady, home_chord_since_, true) >=
+        get_parameter("gesture_chord_stable_sec").as_double())
+      {
+        home_chord_armed_ = false;
+        home_chord_candidate_ = false;
+        return GestureKind::Home;
       }
     }
     const bool controls_released = joy.buttons[4] == 0 && joy.buttons[5] == 0 &&
@@ -1943,8 +2277,8 @@ private:
       kind = GestureKind::Shake;
     } else if (buttons == 0x09) { // X + B
       kind = GestureKind::Baoquan;
-    } else if (buttons == 0x06) { // Y + A
-      kind = GestureKind::Home;
+    } else if (buttons == 0x0a) { // A + B
+      kind = GestureKind::Zero;
     }
     if (!kind) {
       gesture_chord_candidate_ = 0;
@@ -2007,16 +2341,15 @@ private:
       return false;
     }
     for (int side = 0; side < kSideCount; ++side) {
-      if (kind == GestureKind::Home &&
-        outsideJointRange(measured[side], q_min_[side], q_max_[side]))
+      if (outsideJointRange(measured[side], q_min_[side], q_max_[side]))
       {
         RCLCPP_WARN(
-          get_logger(), "home chord rejected: %s arm feedback outside URDF limits",
-          side == kLeftSide ? "left" : "right");
+          get_logger(), "gesture %s rejected: %s arm feedback outside URDF limits",
+          qiling_kinematics::gestureName(kind), side == kLeftSide ? "left" : "right");
         gesture_plan_.reset();
         return false;
       }
-      const double tracking_error = (measured[side] - start[side]).cwiseAbs().maxCoeff();
+      const double tracking_error = armTrackingError(side, measured[side], start[side]);
       if (tracking_error >
         get_parameter("gesture_start_tracking_tolerance_rad").as_double())
       {
@@ -2045,7 +2378,8 @@ private:
     gesture_phase_time_sec_ = 0.0;
     gesture_settle_accum_sec_ = 0.0;
     gesture_run_phase_ = GestureRunPhase::Running;
-    gesture_hand_status_ = kind == GestureKind::Home ? GestureStatus::ReturnOpen :
+    gesture_hand_status_ = (kind == GestureKind::Home || kind == GestureKind::Zero) ?
+      GestureStatus::ReturnOpen :
       kind == GestureKind::Wave ? GestureStatus::Wave :
       kind == GestureKind::Baoquan ? GestureStatus::BaoquanPose : GestureStatus::ShakeOpen;
     publishGestureStatus();
@@ -2056,13 +2390,12 @@ private:
   }
 
   bool runGesture(
-    Clock::time_point now_steady,
+    std::optional<GestureKind> chord,
     const std::array<ArmVector, kSideCount> & measured,
     bool left_fresh, bool right_fresh, bool control_stalled, double dt,
     const std::array<std::uint8_t, kSideCount> & modes)
   {
     if (gesture_run_phase_ == GestureRunPhase::Idle) {
-      const auto chord = pendingGestureChord(now_steady);
       if (!get_parameter("gesture_enabled").as_bool() || !chord ||
         !left_fresh || !right_fresh || control_stalled ||
         modes[kLeftSide] != 0 || modes[kRightSide] != 0 ||
@@ -2090,7 +2423,7 @@ private:
     }
     const double tracking_limit =
       get_parameter("gesture_motion_tracking_tolerance_rad").as_double();
-    if (maxJointError(measured, gesture_command_q_) > tracking_limit)
+    if (maxArmTrackingError(measured, gesture_command_q_) > tracking_limit)
     {
       gestureFault("arm feedback diverged from gesture command");
       return true;
@@ -2102,7 +2435,8 @@ private:
       gesture_command_qdot_ = frame.velocity;
       if (frame.phase == GesturePhase::ReturnHome || frame.phase == GesturePhase::Complete) {
         gesture_hand_status_ = GestureStatus::ReturnOpen;
-      } else if (gesture_plan_->kind() == GestureKind::Home) {
+      } else if (gesture_plan_->kind() == GestureKind::Home ||
+        gesture_plan_->kind() == GestureKind::Zero) {
         gesture_hand_status_ = GestureStatus::ReturnOpen;
       } else if (gesture_plan_->kind() == GestureKind::Wave) {
         gesture_hand_status_ = GestureStatus::Wave;
@@ -2120,14 +2454,15 @@ private:
       }
     } else if (gesture_run_phase_ == GestureRunPhase::Settling) {
       gesture_phase_time_sec_ += dt;
-      gesture_command_q_ = home_q_;
+      const auto & end_pose = gesture_plan_->endPose();
+      gesture_command_q_ = end_pose;
       for (auto & value : gesture_command_qdot_) {
         value.setZero();
       }
       const double left_home_error =
-        (measured[kLeftSide] - home_q_[kLeftSide]).cwiseAbs().maxCoeff();
+        (measured[kLeftSide] - end_pose[kLeftSide]).cwiseAbs().maxCoeff();
       const double right_home_error =
-        (measured[kRightSide] - home_q_[kRightSide]).cwiseAbs().maxCoeff();
+        (measured[kRightSide] - end_pose[kRightSide]).cwiseAbs().maxCoeff();
       const double home_tolerance =
         get_parameter("gesture_home_tolerance_rad").as_double();
       if (std::max(left_home_error, right_home_error) <= home_tolerance)
@@ -2138,9 +2473,10 @@ private:
         {
           RCLCPP_INFO(
             get_logger(),
-            "gesture home settled: left_error=%.4f right_error=%.4f tolerance=%.4f rad",
+            "gesture %s settled: left_error=%.4f right_error=%.4f tolerance=%.4f rad",
+            qiling_kinematics::gestureName(gesture_plan_->kind()),
             left_home_error, right_home_error, home_tolerance);
-          gesture_handoff_start_ = home_q_;
+          gesture_handoff_start_ = end_pose;
           gesture_handoff_target_ = measured;
           gesture_run_phase_ = GestureRunPhase::Handoff;
           gesture_phase_time_sec_ = 0.0;
@@ -2150,14 +2486,14 @@ private:
       }
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 1000,
-        "gesture waiting for home feedback: left_error=%.4f right_error=%.4f "
+        "gesture waiting for final pose feedback: left_error=%.4f right_error=%.4f "
         "tolerance=%.4f rad elapsed=%.2f s",
         left_home_error, right_home_error, home_tolerance, gesture_phase_time_sec_);
       if (gesture_phase_time_sec_ >
         get_parameter("gesture_home_settle_timeout_sec").as_double())
       {
         gestureFault(
-          "gesture home feedback did not settle: left_error=" +
+          "gesture final pose feedback did not settle: left_error=" +
           std::to_string(left_home_error) + " right_error=" +
           std::to_string(right_home_error) + " tolerance=" +
           std::to_string(home_tolerance));
@@ -2184,8 +2520,11 @@ private:
         gesture_chord_candidate_ = 0;
         gesture_run_phase_ = GestureRunPhase::Idle;
         gesture_hand_status_ = GestureStatus::Idle;
+        const bool ended_at_zero = gesture_plan_->kind() == GestureKind::Zero;
         gesture_plan_.reset();
-        RCLCPP_INFO(get_logger(), "gesture returned home; teleoperation rearmed after Grip release");
+        RCLCPP_INFO(
+          get_logger(), "gesture reached %s; teleoperation rearmed after Grip release",
+          ended_at_zero ? "zero" : "home");
       }
     }
     publishGestureStatus();
@@ -2194,6 +2533,14 @@ private:
 
   void controlTick()
   {
+    if (collision_warmup_.valid() &&
+      collision_warmup_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+      const std::string error = collision_warmup_.get();
+      if (!error.empty()) {
+        RCLCPP_ERROR(get_logger(), "recovery collision model unavailable: %s", error.c_str());
+      }
+    }
     const auto now_steady = Clock::now();
     const double raw_dt =
       std::chrono::duration<double>(now_steady - last_control_tick_).count();
@@ -2238,11 +2585,23 @@ private:
       modes = requested_modes_;
     }
 
+    // A home request is an input event, even while feedback is temporarily
+    // unavailable. Queue it and start the recovery only after both arms have
+    // fresh measurements; never guess a joint configuration.
+    const auto chord = pendingGestureChord(now_steady);
+    if (chord && *chord == GestureKind::Home &&
+      (recovery_phase_ == RecoveryRunPhase::Idle ||
+      recovery_phase_ == RecoveryRunPhase::Fault))
+    {
+      recovery_pending_ = true;
+      gesture_chord_armed_ = false;
+      gesture_chord_candidate_ = 0;
+    }
     if (!state_received[kLeftSide] && !state_received[kRightSide]) {
       return;
     }
 
-    const auto arm_kinematics = kinematics_->evaluate(
+    const auto measured_kinematics = kinematics_->evaluate(
       q_snapshot[kLeftSide], q_snapshot[kRightSide]);
     gravity_torques_ = kinematics_->gravityTorques(
       q_snapshot[kLeftSide], q_snapshot[kRightSide]);
@@ -2263,7 +2622,26 @@ private:
       kLeftSide, q_snapshot[kLeftSide], left_state_fresh, dt, control_stalled);
     updateMeasuredVelocity(
       kRightSide, q_snapshot[kRightSide], right_state_fresh, dt, control_stalled);
-    publishCurrentState(arm_kinematics, left_state_fresh, right_state_fresh);
+    publishCurrentState(measured_kinematics, left_state_fresh, right_state_fresh);
+
+    // Y+A preempts gesture fault, active Grip, startup home, or ordinary Hold
+    // once fresh feedback is present.
+    if (recovery_pending_ && left_state_fresh && right_state_fresh &&
+      !control_stalled && recovery_phase_ != RecoveryRunPhase::Preflight &&
+      recovery_phase_ != RecoveryRunPhase::Running &&
+      recovery_phase_ != RecoveryRunPhase::Settling &&
+      recovery_phase_ != RecoveryRunPhase::Handoff)
+    {
+      requestRecoveryHome(q_snapshot);
+    }
+    if (runRecoveryHome(
+        q_snapshot, left_state_fresh, right_state_fresh, control_stalled, dt))
+    {
+      publishHomeStatus();
+      publishCommand(
+        leg_q_snapshot, q_snapshot, recovery_command_q_, recovery_command_qdot_);
+      return;
+    }
 
     // Home/re-home owns the arm command path until both measured arms have
     // reached the configured home pose. XR targets and Grip modes are ignored
@@ -2306,7 +2684,7 @@ private:
     // teleoperation. The independent Grip targets are ignored until the
     // trajectory has returned home and the handoff has finished.
     if (runGesture(
-        now_steady, q_snapshot, left_state_fresh, right_state_fresh,
+        chord, q_snapshot, left_state_fresh, right_state_fresh,
         control_stalled, dt, modes))
     {
       publishCommand(
@@ -2322,13 +2700,16 @@ private:
       }
     }
 
+    const auto planned_kinematics = kinematics_->evaluate(
+      left_control_.initialized() ? left_control_.reference() : q_snapshot[kLeftSide],
+      right_control_.initialized() ? right_control_.reference() : q_snapshot[kRightSide]);
     processArm(
-      kLeftSide, "left", arm_kinematics[kLeftSide], q_snapshot[kLeftSide],
+      kLeftSide, "left", planned_kinematics[kLeftSide], q_snapshot[kLeftSide],
       targets[kLeftSide], teleop_side_ready_[kLeftSide] && modes[kLeftSide] != 0,
       state_received[kLeftSide], state_age[kLeftSide], target_age[kLeftSide],
       control_stalled, dt, left_control_, *left_solver_, left_diagnostics_);
     processArm(
-      kRightSide, "right", arm_kinematics[kRightSide], q_snapshot[kRightSide],
+      kRightSide, "right", planned_kinematics[kRightSide], q_snapshot[kRightSide],
       targets[kRightSide], teleop_side_ready_[kRightSide] && modes[kRightSide] != 0,
       state_received[kRightSide], state_age[kRightSide], target_age[kRightSide],
       control_stalled, dt, right_control_, *right_solver_, right_diagnostics_);
@@ -2348,8 +2729,14 @@ private:
   {
     const std::array<ArmVector, kSideCount> references = {
       left_control_.reference(), right_control_.reference()};
-    const std::array<ArmVector, kSideCount> velocities = {
+    std::array<ArmVector, kSideCount> velocities = {
       ArmVector::Zero(), ArmVector::Zero()};
+    if (left_control_.active()) {
+      velocities[kLeftSide] = left_control_.previousVelocity();
+    }
+    if (right_control_.active()) {
+      velocities[kRightSide] = right_control_.previousVelocity();
+    }
     publishCommand(leg_positions, measured, references, velocities);
   }
 
@@ -2474,7 +2861,8 @@ private:
   {
     const bool gravity_phase = home_phase_ == StartupHomePhase::Complete ||
       home_phase_ == StartupHomePhase::HoldForRecording ||
-      home_phase_ == StartupHomePhase::MoveDirectToHome;
+      home_phase_ == StartupHomePhase::MoveDirectToHome ||
+      home_phase_ == StartupHomePhase::RecoveryFault;
     if (!get_parameter("gravity_compensation_enabled").as_bool() || !gravity_phase ||
       gravity_blend_scale_ <= 0.0 || side < 0 || side >= kSideCount ||
       joint < 0 || joint >= kSingleArmDof)
@@ -2555,6 +2943,7 @@ private:
   std::array<Eigen::Vector3d, kSideCount> home_elbow_direction_{};
   std::array<TimedTarget, kSideCount> filtered_targets_{};
   std::array<bool, kSideCount> filtered_target_valid_{};
+  std::array<ServoTargetGovernor, kSideCount> target_governors_{};
   std::array<ArmVector, kSideCount> previous_measured_q_{};
   std::array<ArmVector, kSideCount> measured_velocity_{};
   std::array<bool, kSideCount> measured_velocity_initialized_{};
@@ -2579,9 +2968,12 @@ private:
   JoyMsg gesture_joy_;
   Clock::time_point gesture_joy_time_{};
   Clock::time_point gesture_chord_since_{};
+  Clock::time_point home_chord_since_{};
   std::mutex gesture_joy_mutex_;
   bool gesture_joy_received_{false};
   bool gesture_chord_armed_{false};
+  bool home_chord_armed_{true};
+  bool home_chord_candidate_{false};
   std::uint8_t gesture_chord_candidate_{0};
   GestureRunPhase gesture_run_phase_{GestureRunPhase::Idle};
   GestureStatus gesture_hand_status_{GestureStatus::Idle};
@@ -2593,6 +2985,21 @@ private:
   double gesture_elapsed_sec_{0.0};
   double gesture_phase_time_sec_{0.0};
   double gesture_settle_accum_sec_{0.0};
+
+  RecoveryRunPhase recovery_phase_{RecoveryRunPhase::Idle};
+  bool recovery_pending_{false};
+  std::future<RecoveryPreflightResult> recovery_preflight_;
+  std::future<std::string> collision_warmup_;
+  std::optional<RecoveryHomePlan> recovery_plan_;
+  std::array<ArmVector, kSideCount> recovery_planned_measured_{};
+  int recovery_replans_{0};
+  std::array<ArmVector, kSideCount> recovery_command_q_{};
+  std::array<ArmVector, kSideCount> recovery_command_qdot_{};
+  std::array<ArmVector, kSideCount> recovery_handoff_target_{};
+  double recovery_elapsed_sec_{0.0};
+  double recovery_phase_time_sec_{0.0};
+  double recovery_settle_sec_{0.0};
+  double recovery_bad_tracking_sec_{0.0};
 
   StartupHomePhase home_phase_{StartupHomePhase::WaitingForState};
   bool home_started_{false};

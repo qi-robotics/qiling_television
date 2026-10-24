@@ -1,6 +1,8 @@
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -75,6 +77,10 @@ public:
     declare_parameter("require_home_complete", true);
     declare_parameter("gesture_status_topic", std::string("/teleop/gesture_status"));
     declare_parameter("gesture_status_timeout_sec", 0.30);
+    const double refresh_hz = declare_parameter<double>("command_refresh_hz", 10.0);
+    if (!std::isfinite(refresh_hz) || refresh_hz < 1.0 || refresh_hz > 20.0) {
+      throw std::runtime_error("command_refresh_hz must be in [1, 20]");
+    }
 
     const Position default_open = {255, 104, 255, 255, 255, 255};
     const Position default_close = {101, 60, 0, 0, 0, 0};
@@ -99,7 +105,7 @@ public:
     const auto command_topic = get_parameter("command_topic").as_string();
     const auto home_topic = get_parameter("home_complete_topic").as_string();
 
-    command_pub_ = create_publisher<qi::msg::HandsCmd>(command_topic, rclcpp::QoS(10));
+    command_pub_ = create_publisher<qi::msg::HandsCmd>(command_topic, rclcpp::QoS(1));
     state_sub_ = create_subscription<std_msgs::msg::UInt8>(
       state_topic, rclcpp::QoS(1),
       [this](const std_msgs::msg::UInt8::SharedPtr message) {
@@ -121,12 +127,16 @@ public:
       [this](const std_msgs::msg::UInt8::SharedPtr message) {
         onGestureStatus(message->data);
       });
+    refresh_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / refresh_hz)),
+      std::bind(&O6CommandAdapterNode::refreshCommand, this));
 
     RCLCPP_INFO(
       get_logger(),
       "O6 command adapter ready: state=%s, command=%s, speed=%d, "
-      "hold-last-target-on-input-loss=true",
-      state_topic.c_str(), command_topic.c_str(), speed_);
+      "hold-last-target-on-input-loss=true, refresh=%.1f Hz",
+      state_topic.c_str(), command_topic.c_str(), speed_, refresh_hz);
     RCLCPP_INFO(
       get_logger(), "open=%s, close=%s",
       formatPosition(open_position_).c_str(), formatPosition(close_position_).c_str());
@@ -140,20 +150,18 @@ private:
     const GestureStatus next = raw <= static_cast<std::uint8_t>(GestureStatus::Preflight) ?
       static_cast<GestureStatus>(raw) : GestureStatus::Fault;
     if (next == gesture_status_) {
-      repeatBaoquanHandCommand(next);
       return;
     }
-    pending_baoquan_repeats_ = 0;
     const GestureStatus previous = gesture_status_;
     gesture_status_ = next;
     if (next == GestureStatus::Idle) {
       if (previous != GestureStatus::Idle) {
-        trigger_release_ready_ = false;
+        trigger_rearm_mask_ = kLeftMask | kRightMask;
         have_state_ = false;
       }
       return;
     }
-    trigger_release_ready_ = false;
+    trigger_rearm_mask_ = kLeftMask | kRightMask;
     if (next == GestureStatus::Preflight || next == GestureStatus::Fault) {
       return; // Retain the last physical hand target while motion is locked.
     }
@@ -161,44 +169,16 @@ private:
       publishPositions(open_position_, gesture_shake_right_position_, "gesture shake grip");
     } else if (next == GestureStatus::BaoquanPose) {
       publishPositions(open_position_, gesture_baoquan_right_position_, "gesture baoquan pose");
-      scheduleBaoquanHandRepeats(next);
     } else if (next == GestureStatus::ReturnOpen && previous == GestureStatus::BaoquanPose) {
       publishPositions(open_position_, open_position_, "gesture baoquan hands open");
-      scheduleBaoquanHandRepeats(next);
     } else {
       publishPositions(open_position_, open_position_, "gesture hands open");
     }
   }
 
-  void scheduleBaoquanHandRepeats(GestureStatus status)
-  {
-    pending_baoquan_repeat_status_ = status;
-    pending_baoquan_repeats_ = 2;
-    next_baoquan_repeat_at_ =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-  }
-
-  void repeatBaoquanHandCommand(GestureStatus status)
-  {
-    if (pending_baoquan_repeats_ == 0 || status != pending_baoquan_repeat_status_ ||
-      std::chrono::steady_clock::now() < next_baoquan_repeat_at_)
-    {
-      return;
-    }
-    if (status == GestureStatus::BaoquanPose) {
-      publishPositions(
-        open_position_, gesture_baoquan_right_position_, "gesture baoquan pose retry");
-    } else {
-      publishPositions(open_position_, open_position_, "gesture baoquan hands open retry");
-    }
-    --pending_baoquan_repeats_;
-    next_baoquan_repeat_at_ =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-  }
-
   void onTriggerState(std::uint8_t raw_state)
   {
-    const std::uint8_t state = raw_state & (kLeftMask | kRightMask);
+    std::uint8_t state = raw_state & (kLeftMask | kRightMask);
     if (!gesture_status_received_ ||
       std::chrono::duration<double>(
         std::chrono::steady_clock::now() - last_gesture_status_time_).count() >
@@ -212,13 +192,10 @@ private:
     if (get_parameter("require_home_complete").as_bool() && !home_complete_) {
       return;
     }
-    if (!trigger_release_ready_) {
-      if (state != 0) {
-        return;
-      }
-      trigger_release_ready_ = true;
-      have_state_ = false;
-    }
+    // Each hand rearms on its own release after an action. A held trigger on
+    // one controller must not block the other controller's fingers.
+    trigger_rearm_mask_ &= state;
+    state &= static_cast<std::uint8_t>(~trigger_rearm_mask_);
 
     if (!have_state_) {
       have_state_ = true;
@@ -265,10 +242,33 @@ private:
     command.hands[1].hand_id = 1;
 
     command_pub_->publish(command);
-    RCLCPP_INFO(
-      get_logger(),
-      "%s: left=%s, right=%s, speed=%d",
-      reason, formatPosition(left_position).c_str(), formatPosition(right_position).c_str(), speed_);
+    last_left_position_ = left_position;
+    last_right_position_ = right_position;
+    have_command_target_ = true;
+    if (reason != nullptr) {
+      if (command_pub_->get_subscription_count() == 0) {
+        RCLCPP_WARN(
+          get_logger(), "no /handscmd subscriber discovered; O6 command may not be received");
+      }
+      RCLCPP_INFO(
+        get_logger(),
+        "%s: left=%s, right=%s, speed=%d",
+        reason, formatPosition(left_position).c_str(), formatPosition(right_position).c_str(), speed_);
+    }
+  }
+
+  void refreshCommand()
+  {
+    if (!have_command_target_ || !gesture_status_received_ || !home_complete_ ||
+      gesture_status_ == GestureStatus::Fault ||
+      gesture_status_ == GestureStatus::Preflight ||
+      std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - last_gesture_status_time_).count() >
+      get_parameter("gesture_status_timeout_sec").as_double())
+    {
+      return;
+    }
+    publishPositions(last_left_position_, last_right_position_, nullptr);
   }
 
   Position open_position_{};
@@ -279,18 +279,19 @@ private:
   bool home_complete_{false};
   bool home_status_received_{false};
   bool have_state_{false};
-  bool trigger_release_ready_{false};
+  std::uint8_t trigger_rearm_mask_{kLeftMask | kRightMask};
   bool gesture_status_received_{false};
+  bool have_command_target_{false};
   GestureStatus gesture_status_{GestureStatus::Idle};
-  GestureStatus pending_baoquan_repeat_status_{GestureStatus::Idle};
-  int pending_baoquan_repeats_{0};
-  std::chrono::steady_clock::time_point next_baoquan_repeat_at_{};
+  Position last_left_position_{};
+  Position last_right_position_{};
   std::chrono::steady_clock::time_point last_gesture_status_time_{};
   std::uint8_t last_state_{0};
   rclcpp::Publisher<qi::msg::HandsCmd>::SharedPtr command_pub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr state_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr home_sub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr gesture_sub_;
+  rclcpp::TimerBase::SharedPtr refresh_timer_;
 };
 
 int main(int argc, char ** argv)

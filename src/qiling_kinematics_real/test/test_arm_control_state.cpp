@@ -97,6 +97,28 @@ TEST(ArmControlState, HoldNeverIntegrates)
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
 }
 
+TEST(ArmControlState, TrackingExemptionDoesNotRemoveJointPositionLimits)
+{
+  ArmControlState state("left");
+  const ArmVector measured = ArmVector::Zero();
+  state.initialize(measured);
+  state.updateGripRequest(true, measured);
+
+  const ArmVector q_min = ArmVector::Constant(-1.0);
+  const ArmVector q_max = ArmVector::Constant(1.0);
+  ArmVector qdot = ArmVector::Zero();
+  qdot[6] = 1.0;
+
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_TRUE(state.integrateReference(qdot, 0.1, measured, q_min, q_max, 0.2, 6));
+  }
+  EXPECT_NEAR(state.reference()[6], 0.5, 1.0e-12);
+
+  qdot[6] = 10.0;
+  ASSERT_TRUE(state.integrateReference(qdot, 0.1, measured, q_min, q_max, 0.2, 6));
+  EXPECT_NEAR(state.reference()[6], 1.0, 1.0e-12);
+}
+
 TEST(ArmControlState, GripReleasePreservesReferenceAndResetsVelocity)
 {
   ArmControlState state("left");
@@ -124,7 +146,7 @@ TEST(ArmControlState, GripReleasePreservesReferenceAndResetsVelocity)
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
 }
 
-TEST(ArmControlState, FaultReleaseResynchronizesReference)
+TEST(ArmControlState, FaultReleaseWaitsForExplicitRecovery)
 {
   ArmControlState state("left");
   const ArmVector measured = ArmVector::Zero();
@@ -138,10 +160,14 @@ TEST(ArmControlState, FaultReleaseResynchronizesReference)
 
   const ArmVector released_measured = ArmVector::Constant(0.3);
   state.updateGripRequest(false, released_measured);
-  EXPECT_EQ(state.state(), ArmRunState::Hold);
-  EXPECT_FALSE(state.releaseRequired());
-  EXPECT_TRUE(state.reference().isApprox(released_measured));
+  EXPECT_EQ(state.state(), ArmRunState::Fault);
+  EXPECT_TRUE(state.releaseRequired());
+  EXPECT_TRUE(state.reference().isApprox(measured));
   EXPECT_TRUE(state.previousVelocity().isZero(0.0));
+
+  state.completeRecovery(released_measured);
+  EXPECT_EQ(state.state(), ArmRunState::Hold);
+  EXPECT_TRUE(state.reference().isApprox(released_measured));
 }
 
 TEST(ArmControlState, HoldKeepsLatchedReference)
@@ -366,8 +392,9 @@ TEST(ArmControlState, ConsecutiveFailuresLatchFault)
   EXPECT_EQ(state.state(), ArmRunState::Fault);
 
   state.updateGripRequest(false, measured);
+  EXPECT_EQ(state.state(), ArmRunState::Fault);
+  state.completeRecovery(measured);
   EXPECT_EQ(state.state(), ArmRunState::Hold);
-  EXPECT_FALSE(state.releaseRequired());
 }
 
 }  // namespace
